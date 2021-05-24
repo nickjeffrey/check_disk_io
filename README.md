@@ -1,5 +1,7 @@
 # check_disk_io
 nagios check for disk IO on UNIX-like systems
+Tested on AIX, FreeBSD, Linux, MacOS.  (
+Not tested on SunOS, HPUX, OpenBSD, NetBSD, but will likely work with minor updates.
 
 This script is executed remotely on a monitored system by the NRPE or check_by_ssh methods available in nagios.
 
