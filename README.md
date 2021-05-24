@@ -25,3 +25,9 @@ If using NRPE, you will also need a section defining the NRPE command in the /us
 ````
     command[check_disk_io]=/usr/local/nagios/libexec/check_disk_io
 ````
+
+Sample output on a Linux system with one disk:
+<img src=images/linux.png>
+
+Sample output on an AIX system with many disks:
+<img src=images/aix.png>
