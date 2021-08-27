@@ -5,27 +5,27 @@
 #  Tested on Linux, FreeBSD, AIX, MacOS
 #
 
-# OUTSTANDING TASKS
-# -----------------
-#  1) test on FreeBSD, Solaris, HPUX
-#  2) Add functionality to AIX section to detect vpath# disks (ie using IBM SDD multipath driver)
-#  3) Add functionality to AIX section to detect vdiskpower# disks (ie using EMC PowerPath multipath driver)
-#  4) Instead of alerting on the first busy disk, get a list of all the busy disks, and send them in a single alert.
 
 
 
 
 # CHANGE LOG
 # ----------
-#   2010-08-18  njeffrey@anisoftgroup.com	Script created for AIX systems
-#   2011-03-05  njeffrey@anisoftgroup.com	Add verbose variable for debugging
-#   2011-03-05  njeffrey@anisoftgroup.com	Bug fix in reporting disk name 
-#   2011-06-27  njeffrey@anisoftgroup.com	Add FreeBSD support
-#   2011-06-27  njeffrey@anisoftgroup.com	Add Linux   support
-#   2012-12-25  njeffrey@anisoftgroup.com       Add nagios perfdata to output
-#   2017-02-02  njeffrey@anisoftgroup.com       Update Linux iostat command to take average of ten 1-second readings instead of a single reading
-#   2017-02-02  njeffrey@anisoftgroup.com       Add support for Raspberry Pi computers using sdcard storage
-#   2017-10-29  njeffrey@anisoftgroup.com	Add MacOS support
+#   2010-08-18  njeffrey	Script created for AIX systems
+#   2011-03-05  njeffrey	Add verbose variable for debugging
+#   2011-03-05  njeffrey	Bug fix in reporting disk name 
+#   2011-06-27  njeffrey	Add FreeBSD support
+#   2011-06-27  njeffrey	Add Linux   support
+#   2012-12-25  njeffrey       	Add nagios perfdata to output
+#   2016-05-19  njeffrey      	Add disk queue depth checks on AIX
+#   2017-02-02  njeffrey       	Update Linux iostat command to take average of ten 1-second readings instead of a single reading
+#   2017-02-02  njeffrey       	Add support for Raspberry Pi computers using sdcard storage
+#   2017-10-29  njeffrey	Add MacOS support
+#   2021-05-21  njeffrey	Enhance AIX section to add details for vscsi and FC adapters
+#   2021-08-26  njeffrey	Add $skip_idle_disks flag to suppress idle disks from the output
+#   2021-08-26  njeffrey	Add $count variable, throw away the first iostat record on Linux
+#   2021-08-26  njeffrey	Break out run_iostat subroutine into separate subroutines for each operating system
+#   2021-08-26  njeffrey	For Linux DM-Multipath environment, suppress output for /dev/sd?? paths, only show dm-???
 
 
 
@@ -47,29 +47,38 @@
 #      define service {
 #              use                             generic-24x7-service
 #              hostgroup_name                  all_aix,all_linux,all_freebsd,all_macos
-#              service_description             Check disk IO
+#              service_description             disk IO
 #              check_command                   check_by_ssh!/usr/local/nagios/libexec/check_disk_io
 #              }
 
 
 use diagnostics;                                #tell the perl interpreter to give us verbose messages while debugging
 use strict;                                     #enforce good coding practices
+use Getopt::Long;                               #allow --long-switches to be used as parameters
+use POSIX;                                      #use perl core module to emulate uname command to determine operating system
 
 
 
-
-
+my ($iostat,$fcstat,$lsdev,$lsattr,$iops,$read_latency,$read_latency_threshold,$write_latency,$write_latency_threshold,@fields,%fc_adapters,$skip_idle_disks);
+my ($count,$issue_count,%issues);
+my ($opt_h,$opt_v);
+my ($total_iops,$total_MBps,$total_latency,$total_read_latency,$total_write_latency);
 # define variables
-my $iostat              = "";                   			#location of iostat binary
-my $uname               = "";                   			#location of uname binary
+$iostat              = "/usr/bin/iostat";                            #location of iostat binary
+$fcstat              = "/usr/bin/fcstat";                            #location of fcstat binary on AIX systems
+$lsdev               = "/usr/sbin/lsdev";                            #location of lsdev binary on AIX systems
+$lsattr              = "/usr/sbin/lsattr";                           #location of lsattr binary on AIX systems
+$skip_idle_disks     = "yes";                           		#do not put idle (busy=0%) disks in the output
 my $disk_name           = "";                   			#variable to hold name of disk (for multidisk systems)
-my $iops                = "";                   			#variable to hold current iops on a disk
 my %io;               							#hash to contain disk names and perf stats
 my $MBps                = "";						#variable to hold MBps throughput of disk
 my $ostype              = "";						#assorted UNIX flavors have their quirks.  Figure out what OS we are running on.
 my $key                 = "";						#placeholder for looping through hash keys
 my $percent_busy        = "";						#variable to hold %busy for those operating systems that report this value
+my $latency             = "";						#variable to hold disk service time
 my $disk_busy_threshold = 40;						#alert when disk busy % reaches this value
+$read_latency_threshold  = 30;                                          #alert when disk read latency reaches this value (in milliseconds)
+$write_latency_threshold = 30;                                          #alert when disk read latency reaches this value (in milliseconds)
 my $verbose             = "no";						#yes/no flag for verbose output for debugging
 my ($freebsd_disk,@freebsd_disks);					#array to hold names of disks on FreeBSD
 my ($macos_disk,@macos_disks);						#array to hold names of disks on MacOS
@@ -87,79 +96,124 @@ $CRITICAL=      2;                              			#this script returns a value 
 $UNKNOWN=       3;                              			#this script returns a value to nagios for processing
 
 
+sub get_options {
+   #
+   # this gets the command line parameters provided by the users
+   print "running get_options subroutine \n" if ($verbose eq "yes");
+   #
+   Getopt::Long::Configure('bundling');
+   GetOptions(
+      "h"   => \$opt_h, "help"        => \$opt_h,
+      "v"   => \$opt_v, "verbose"     => \$opt_v,
+   );
+   #
+   #
+   # see if user provided -v or --verbose switch
+   if ( defined($opt_v) ) {
+      $verbose = "yes";
+      print "   setting verbose=yes \n";
+   }                                                    #end of if block
+   #
+   #
+   # see if user provided -h or --help switch
+   if ( defined($opt_h) ) {
+      print "   Usage: $0  \n";
+      print "   Usage: $0 --verbose \n";
+      print "   Usage: $0 --help \n";
+      exit;
+   }                                                    #end of if block
+}                       #end of subroutine
+
+
+
+sub check_operating_system {
+   #
+   print "running check_operating_system subroutine \n" if ($verbose eq "yes");
+   #
+   # call core perl module to determine operating system
+   my ($sysname, $nodename, $release, $version, $machine) = POSIX::uname();
+   #
+   # Figure out what operating system is running
+   $ostype = "unknown";                                         #initialize variable
+   $ostype = "Linux"   if ( $sysname =~ /Linux/) ;
+   $ostype = "FreeBSD" if ( $sysname =~ /FreeBSD/) ;
+   $ostype = "AIX"     if ( $sysname =~ /AIX/) ;
+   $ostype = "SunOS"   if ( $sysname =~ /SunOS/) ;
+   $ostype = "HP-UX"   if ( $sysname =~ /HP-UX/) ;
+   print "   Detected operating system: $ostype \n" if ($verbose eq "yes");
+   #
+   if ( $ostype eq "unknown" ) {
+      print "$CHECK_NAME UNKNOWN - Cannot determine operating system \n";
+      exit $UNKNOWN;
+   }                                                            #end of if block
+}                                                               #end of subroutine
 
 
 
 
 sub sanity_checks {
+   #
    print "running sanity_checks subroutine \n" if ($verbose eq "yes");
    #
    # confirm the iostat binary exists and is executable
    #
-   $iostat = "/usr/bin/iostat";						#give a default location
-   $iostat = "/usr/bin/iostat"  if ( -e "/usr/bin/iostat");		#location on AIX, Linux
-   $iostat = "/usr/sbin/iostat" if ( -e "/usr/sbin/iostat");		#location on FreeBSD
-   if ( ! -e $iostat ) {
-      print "$CHECK_NAME CRITICAL - Cannot find $iostat binary. If you are using Linux, try yum install sysstat\n";
-      exit( $CRITICAL );
-   }
-   if ( ! -x $iostat ) {
-      print "$CHECK_NAME CRITICAL - $iostat binary is not executable by the current user.\n";
-      exit( $CRITICAL );
-   }
+   $iostat = "/usr/bin/iostat";                                         #give a default location
+   $iostat = "/usr/bin/iostat"  if ( -e "/usr/bin/iostat");             #location on AIX, Linux
+   $iostat = "/usr/sbin/iostat" if ( -e "/usr/sbin/iostat");            #location on FreeBSD
    #
-   # confirm the uname binary exists and is executable
+   $_ = $iostat;
+   if ( ! -e "$_" ) {  print "$CHECK_NAME UNKNOWN required file $_ not found \n"                            ; exit $UNKNOWN; }
+   if ( ! -x "$_" ) {  print "$CHECK_NAME UNKNOWN required file $_ is not executable by the nagios user \n" ; exit $UNKNOWN; }
    #
-   $uname = "/usr/bin/uname";						#give a default location
-   $uname = "/usr/bin/uname"  if ( -e "/usr/bin/uname");		#location on AIX, FreeBSD
-   $uname = "/bin/uname"      if ( -e "/bin/uname");			#location on Linux
-   if ( ! -e $uname ) {
-      print "$CHECK_NAME CRITICAL - Cannot find $uname binary \n";
-      exit( $CRITICAL );
-   }
-   if ( ! -x $uname ) {
-      print "$CHECK_NAME CRITICAL - $uname binary is not executable by the current user \n";
-      exit( $CRITICAL );
-   }		
-}		 						#end of subroutine
+   if ($ostype eq "AIX") {                                      #AIX-specific checks
+      $_ = $fcstat;
+      if ( ! -e "$_" ) {  print "$CHECK_NAME UNKNOWN required file $_ not found \n"                            ; exit $UNKNOWN; }
+      if ( ! -x "$_" ) {  print "$CHECK_NAME UNKNOWN required file $_ is not executable by the nagios user \n" ; exit $UNKNOWN; }
+      $_ = $lsdev;
+      if ( ! -e "$_" ) {  print "$CHECK_NAME UNKNOWN required file $_ not found \n"                            ; exit $UNKNOWN; }
+      if ( ! -x "$_" ) {  print "$CHECK_NAME UNKNOWN required file $_ is not executable by the nagios user \n" ; exit $UNKNOWN; }
+      $_ = $lsattr;
+      if ( ! -e "$_" ) {  print "$CHECK_NAME UNKNOWN required file $_ not found \n"                            ; exit $UNKNOWN; }
+      if ( ! -x "$_" ) {  print "$CHECK_NAME UNKNOWN required file $_ is not executable by the nagios user \n" ; exit $UNKNOWN; }
+   }                                                            #end of if block
+}   
 
 
 
-
-sub run_iostat {
-   print "running run_iostat subroutine \n" if ($verbose eq "yes");
+sub run_iostat_SunOS {
    #
-   # Figure out what operating system is running
-   $ostype = "unknown";						#initialize variable 
-   open(IN,"$uname|");      					#open filehandle using command output
-   while (<IN>) {                                               #read a line from filehandle
-      $ostype = "Linux"   if ( /Linux/)   ;
-      $ostype = "FreeBSD" if ( /FreeBSD/) ;
-      $ostype = "AIX"     if ( /AIX/)     ;
-      $ostype = "SunOS"   if ( /SunOS/)   ;
-      $ostype = "HP-UX"   if ( /HP-UX/)   ;
-      $ostype = "MacOS"   if ( /Darwin/)  ;
-   }								#end of while loop
-   close IN;							#close filehandle
-   print "   Detected operating system: $ostype \n" if ($verbose eq "yes");
-   #
+   print "running run_iostat_SunOS subroutine \n" if ($verbose eq "yes");
    #
    #
    if ( $ostype eq "SunOS" ) {
       print "$CHECK_NAME UNKNOWN - this check has not been tested against Solaris.  Please feel free to update this check and send patches to the author.\n";
       exit( $UNKNOWN );
    }								#end of if block
+}								#end of subroutine
+
+
+
+   #
+sub run_iostat_HPUX {
+   #
+   print "running run_iostat_HPUX subroutine \n" if ($verbose eq "yes");
    #
    #
-   #
-   elsif ( $ostype eq "HP-UX" ) {
+   if ( $ostype eq "HP-UX" ) {
       print "$CHECK_NAME UNKNOWN - this check has not been tested against HP-UX.  Please feel free to update this check and send patches to the author.\n";
       exit( $UNKNOWN );
    }								#end of if block
+}								#end of subroutine
+
+
+
+
+sub run_iostat_FreeBSD {
+   #
+   print "running run_iostat_HPUX subroutine \n" if ($verbose eq "yes");
    #
    #
-   #
-   elsif ( $ostype eq "FreeBSD" ) {
+   if ( $ostype eq "FreeBSD" ) {
       #
       # This is the output of "iostat -t da " from a FreeBSD system
       #      
@@ -206,10 +260,21 @@ sub run_iostat {
          close IN;						#close filehandle
       }								#end of foreach block
    }								#end of if block
+}								#end of subroutine
+
+
+
+
+
+   
+  
+ 
+sub run_iostat_MacOS {
+   #
+   print "running run_iostat_MacOS subroutine \n" if ($verbose eq "yes");
    #
    #
-   #
-   elsif ( $ostype eq "MacOS" ) {
+   if ( $ostype eq "MacOS" ) {
       #
       # This is the output of "iostat -d" from a MacOS system.
       #      
@@ -280,135 +345,552 @@ sub run_iostat {
          }                                                                 #end of foreach loop
       }								#end of foreach block
    }								#end of if block
+}								#end of subroutine
+
+
+
+
+
+
+
+
+sub run_iostat_Linux {
+   #
+   print "running run_iostat_Linux subroutine \n" if ($verbose eq "yes");
    #
    #
+   return unless ( $ostype eq "Linux" ); 	#break out of subroutine unless operating system is Linux
    #
-   elsif ( $ostype eq "Linux" ) {
-      #
-      # This is the output of "iostat -d -x -m" from a Linux system.  Note that the -x switch is only supported on 2.5+ kernels
-      # Linux 2.6.18-164.15.1.el5 (rhel01.example.com)  10/18/2010
-      #
-      # Device:         rrqm/s   wrqm/s   r/s   w/s    rMB/s    wMB/s avgrq-sz avgqu-sz   await  svctm  %util
-      # sda               0.04     7.04  0.07  3.44     0.00     0.04    24.40     0.02    5.33   0.39   0.14
-      # sda1              0.00     0.00  0.00  0.00     0.00     0.00    17.46     0.00    3.21   2.70   0.00
-      # sda2              0.03     7.04  0.07  3.44     0.00     0.04    24.40     0.02    5.33   0.39   0.14
-      # dm-0              0.00     0.00  0.11 10.48     0.00     0.04     8.10     0.04    3.95   0.13   0.14
-      # dm-1              0.00     0.00  0.00  0.00     0.00     0.00     8.00     0.00    4.20   0.30   0.00
-      # mmcblk0           0.00     0.00  0.00  0.00     0.00     0.00     8.00     0.00    4.20   0.30   0.00   <--- this is an SD card on a Raspberry Pi
-      #
-      #
-      # NOTES:  SCSI   disks use this naming format:  /dev/sda  /dev/sdb  /dev/sdc
-      #         SATA   disks use this naming format:  /dev/sda  /dev/sdb  /dev/sdc
-      #         IDE    disks use this naming format:  /dev/hda  /dev/hdb  /dev/hdc
-      #         Floppy disks use this naming format:  /dev/fd0  /dev/fd1  /dev/fd2
-      #         SCSI CDROMs  use this naming format:  /dev/scd0 /dev/scd1 /dev/scd2
-      #         SATA CDROMs  use this naming format:  /dev/sr0  /dev/sr1  /dev/sr2
-      #         Raspberry Pi SD card uses this format:    /dev/mmcblk0             <---- this is the only device name we use containing a number
-      #
-      # Get the average of ten iostat iterations, to avoid false alarms when the very first iteration is unusually high
-      open(IN,"$iostat -d -x -m 1 10|");                        #open filehandle using command output
-      while (<IN>) {                                            #read a line from filehandle
-         # We only want to monitor entire disks, not slices or partitions
-         next if ( /^sd[a-z]+[0-9]/ );				#skip SCSI / SATA disk partitions (sda0, sda1, sdb3, etc)
-         next if ( /^hd[a-z]+[0-9]/ );				#skip IDE         disk partitions (hda0, hda1, hdb3, etc)
-         next if ( /^dm\-[0-9]/ );				#skip Linux DM disk multipath devices (dm-0, dm-1, etc)
-         next if ( /^sr[0-9]/ );				#skip CDROM  drives  (sr0, sr1, etc)
-         next if ( /^scd[0-9]/ );				#skip CDROM  drives  (scd0, scd1, etc)
-         next if ( /^fd[0-9]/ );				#skip floppy drives  (fd0, fd1, etc)
-         if ( /([a-zA-Z0-9]+) +([0-9\.]+) +([0-9\.]+) +([0-9\.]+) +([0-9\.]+) +([0-9\.]+) +([0-9\.]+) +([0-9\.]+) +([0-9\.]+) +([0-9\.]+) +([0-9\.]+) +([0-9\.]+)/ ) {
-            $disk_name    = $1;                                 #assign more mnemonic variable name
-            $iops         = $4 + $5;                            #add reads/sec and writes/sec to get total iops
-            $MBps         = $6 + $7;                            #add rMB/s and wMB/s to get total MB/s
-            $percent_busy = $12;                                #add rMB/s and wMB/s to get total MB/s
-            #
-            # initialize hash elements if they do not already exist
-            $io{$disk_name}{iops}=0         unless $io{$disk_name}{iops};
-            $io{$disk_name}{MBps}=0         unless $io{$disk_name}{MBps};
-            $io{$disk_name}{percent_busy}=0 unless $io{$disk_name}{percent_busy};
-            #
-            # Running total of IOPS and MB/second and percent busy
-            $io{$disk_name}{disk_name}    = $disk_name;                                         #add value to hash
-            $io{$disk_name}{iops}         = $io{$disk_name}{iops} + $iops;                      #running total of IOPS
-            $io{$disk_name}{MBps}         = $io{$disk_name}{MBps} + $MBps;                      #running total of MBps
-            $io{$disk_name}{percent_busy} = $io{$disk_name}{percent_busy} + $percent_busy;      #running total of % busy
-            print "   Running Total: disk_name=$disk_name percent_busy=$percent_busy iops=$iops MBps=$MBps \n" if ($verbose eq "yes");
-         }                                                      #end of if block
-      }                                                         #end of while loop
-      close IN;                                                 #close filehandle
-      #
-      ## At this point, we have a running total of 10 iostat iterations.
-      # Now calculate the average by dividing by 10
-      foreach $key (sort keys %io) {                               	#loop through for each disk
-         $io{$key}{iops} =         $io{$key}{iops}         / 10;        #divide by 10 to get average
-         $io{$key}{MBps} =         $io{$key}{MBps}         / 10;        #divide by 10 to get average
-         $io{$key}{percent_busy} = $io{$key}{percent_busy} / 10;        #divide by 10 to get average
+   # This is the output of "iostat -d -x -m" from a Linux system.  Note that the -x switch is only supported on 2.5+ kernels
+   # Linux 2.6.18-164.15.1.el5 (rhel01.example.com)  10/18/2010
+   #
+   # Device:         rrqm/s   wrqm/s   r/s   w/s    rMB/s    wMB/s avgrq-sz avgqu-sz   await  svctm  %util
+   # sda               0.04     7.04  0.07  3.44     0.00     0.04    24.40     0.02    5.33   0.39   0.14
+   # sda1              0.00     0.00  0.00  0.00     0.00     0.00    17.46     0.00    3.21   2.70   0.00
+   # sda2              0.03     7.04  0.07  3.44     0.00     0.04    24.40     0.02    5.33   0.39   0.14
+   # dm-0              0.00     0.00  0.11 10.48     0.00     0.04     8.10     0.04    3.95   0.13   0.14
+   # dm-1              0.00     0.00  0.00  0.00     0.00     0.00     8.00     0.00    4.20   0.30   0.00
+   # mmcblk0           0.00     0.00  0.00  0.00     0.00     0.00     8.00     0.00    4.20   0.30   0.00   <--- this is an SD card on a Raspberry Pi
+   #
+   #
+   # NOTES:  SCSI   disks use this naming format:  /dev/sda  /dev/sdb  /dev/sdc
+   #         SATA   disks use this naming format:  /dev/sda  /dev/sdb  /dev/sdc
+   #         IDE    disks use this naming format:  /dev/hda  /dev/hdb  /dev/hdc
+   #         Floppy disks use this naming format:  /dev/fd0  /dev/fd1  /dev/fd2
+   #         SCSI CDROMs  use this naming format:  /dev/scd0 /dev/scd1 /dev/scd2
+   #         SATA CDROMs  use this naming format:  /dev/sr0  /dev/sr1  /dev/sr2
+   #         Raspberry Pi SD card uses this format:    /dev/mmcblk0             <---- this is the only device name we use containing a number
+   #
+   # Get the average of ten iostat iterations, to avoid false alarms when the very first iteration is unusually high
+   # The first time iostat is run, it sometimes returns a ridiculously high number that throws off the averages.
+   # Run 11 iterations of iostat, but throw away the first value
+   $count = 0;						#initialize counter variable
+   open(IN,"$iostat -d -x -m 1 11|");                        #open filehandle using command output
+   while (<IN>) {                                            #read a line from filehandle
+      # We only want to monitor entire disks, not slices or partitions
+      $count++ if (/^Device:/);				#increment counter variable each time iostat runs
+      print "   count=$count \n" if ($verbose eq "yes");
+      next if ( /^sd[a-z]+[0-9]/ );				#skip SCSI / SATA disk partitions (sda0, sda1, sdb3, etc)
+      next if ( /^hd[a-z]+[0-9]/ );				#skip IDE         disk partitions (hda0, hda1, hdb3, etc)
+      #next if ( /^dm\-[0-9]/ );				#skip Linux DM disk multipath devices (dm-0, dm-1, etc)
+      next if ( /^sr[0-9]/ );				#skip CDROM  drives  (sr0, sr1, etc)
+      next if ( /^scd[0-9]/ );				#skip CDROM  drives  (scd0, scd1, etc)
+      next if ( /^fd[0-9]/ );				#skip floppy drives  (fd0, fd1, etc)
+      if ( /([a-zA-Z0-9\-]+) +([0-9\.]+) +([0-9\.]+) +([0-9\.]+) +([0-9\.]+) +([0-9\.]+) +([0-9\.]+) +([0-9\.]+) +([0-9\.]+) +([0-9\.]+) +([0-9\.]+) +([0-9\.]+)/ ) {
+         next if ( $count == 1 );				#throw away the first value that is sometimes an outlier
+         $disk_name    = $1;                                 #assign more mnemonic variable name
+         $iops         = $4 + $5;                            #add reads/sec and writes/sec to get total iops
+         $MBps         = $6 + $7;                            #add rMB/s and wMB/s to get total MB/s
+         $percent_busy = $12;                                #%util column
+         $latency      = $11;                                #svctm column total latency, not split into read / write
          #
-         $io{$key}{iops}         = sprintf("%.0f",$io{$key}{iops});         #truncate to 0 decimal places
-         $io{$key}{MBps}         = sprintf("%.0f",$io{$key}{MBps});         #truncate to 0 decimal places
-         $io{$key}{percent_busy} = sprintf("%.0f",$io{$key}{percent_busy}); #truncate to 0 decimal places
-         print "   Average: disk_name=$io{$key}{disk_name} percent_busy=$io{$key}{percent_busy} iops=$io{$key}{iops} MBps=$io{$key}{MBps} \n" if ($verbose eq "yes");
-      }                                                                 #end of foreach loop
-   }								#end of if block
+         # initialize hash elements if they do not already exist
+         $io{$disk_name}{iops}=0         unless $io{$disk_name}{iops};
+         $io{$disk_name}{MBps}=0         unless $io{$disk_name}{MBps};
+         $io{$disk_name}{percent_busy}=0 unless $io{$disk_name}{percent_busy};
+         $io{$disk_name}{latency}=0      unless $io{$disk_name}{latency};
+         #
+         # Running total of IOPS and MB/second and percent busy
+         $io{$disk_name}{disk_name}    = $disk_name;                                         #add value to hash
+         $io{$disk_name}{iops}         = $io{$disk_name}{iops} + $iops;                      #running total of IOPS
+         $io{$disk_name}{MBps}         = $io{$disk_name}{MBps} + $MBps;                      #running total of MBps
+         $io{$disk_name}{percent_busy} = $io{$disk_name}{percent_busy} + $percent_busy;      #running total of % busy
+         $io{$disk_name}{latency}      = $io{$disk_name}{latency} + $latency;      	        #running total of svctm
+         print "   Running Total: disk_name=$disk_name percent_busy=$percent_busy iops=$iops MBps=$MBps latency=${latency}ms \n" if ($verbose eq "yes");
+      }                                                      #end of if block
+   }                                                         #end of while loop
+   close IN;                                                 #close filehandle
+   #
+   ## At this point, we have a running total of 10 iostat iterations.
+   # Now calculate the average by dividing by 10
+   foreach $key (sort keys %io) {                               	#loop through for each disk
+      $io{$key}{iops} =         $io{$key}{iops}         / 10;        #divide by 10 to get average
+      $io{$key}{MBps} =         $io{$key}{MBps}         / 10;        #divide by 10 to get average
+      $io{$key}{percent_busy} = $io{$key}{percent_busy} / 10;        #divide by 10 to get average
+      $io{$key}{latency}      = $io{$key}{latency}      / 10;        #divide by 10 to get average
+      #
+      $io{$key}{iops}         = sprintf("%.0f",$io{$key}{iops});         #truncate to 0 decimal places
+      $io{$key}{MBps}         = sprintf("%.0f",$io{$key}{MBps});         #truncate to 0 decimal places
+      $io{$key}{percent_busy} = sprintf("%.0f",$io{$key}{percent_busy}); #truncate to 0 decimal places
+      $io{$key}{latency}      = sprintf("%.0f",$io{$key}{latency});      #truncate to 0 decimal places
+      print "   Average: disk_name=$io{$key}{disk_name} percent_busy=$io{$key}{percent_busy} iops=$io{$key}{iops} MBps=$io{$key}{MBps} latency=$io{$key}{latency}ms \n" if ($verbose eq "yes");
+   }                                                                 #end of foreach loop
+   #
+   #
+   #the iostat utility in Linux will show the statistics for both devicemapper-multipath devices and the underlying
+   #/dev/sd?? devices.  If both /dev/sd?? and /dev/dm-?? devices exist, only show the /dev/dm-?? devices
+   #except for /dev/sda and /dev/sdb, which may be a RAID-1 pair or local disks.
+   my $linux_devicemapper = "";
+   foreach $key (sort keys %io) {
+      if ( $io{$key}{disk_name} =~ /^dm/ ) {
+         $linux_devicemapper = "yes";
+      }
+   }
+   if ( $linux_devicemapper eq "yes" ) {
+      foreach $key (sort keys %io) {
+         next if ( $io{$key}{disk_name} eq "sda" );	#skip local disk
+         next if ( $io{$key}{disk_name} eq "sdb" );	#skip local disk
+         if ( $io{$key}{disk_name} =~ /^sd/ ) {		#this /dev/sd??? device is one path in a /dev/dm-??? device
+            print "   removing linux path $io{$key}{disk_name}\n" if ($verbose eq "yes"); #remove hash element
+            delete $io{$key};				#remove hash element
+         }
+      }
+   }
+   #
+   # Calculate the overall IOPS, MBps, latency averaged across all the disks
+   $total_iops         = 0;				#initiaze variable
+   $total_MBps         = 0;				#initiaze variable
+   $total_latency      = 0;				#initiaze variable
+   foreach $key (sort keys %io) {
+      $total_iops         = $total_iops + $io{$key}{iops};
+      $total_MBps         = $total_MBps + $io{$key}{MBps};
+      $total_latency      = $total_latency + $io{$key}{latency};
+   }							#end of foreach loop
+   # iops and MBps are cumulative, but latency should be averaged
+   $count = 0;						#initialize counter variable
+   foreach $key (sort keys %io) {
+      $count++;						#increment counter
+   }							#end of foreach loop
+   $total_latency = $total_latency / $count;		#average latency across all disks
+   $total_latency = sprintf("%.0f",$total_latency);      #truncate to 0 decimal places
+   #
+   print "   Total_IOPS:$total_iops Total_MBps:$total_MBps Average_latency:${total_latency}ms \n" if ($verbose eq "yes");
+   
+}							#end of subroutine
+
+
+
+
+
+
+
+
+
+sub run_iostat_AIX {
+   #
+   print "running run_iostat_AIX subroutine \n" if ($verbose eq "yes");
+   #
+   return unless ( $ostype eq "AIX" );		#break out of subroutine unless operating system is AIX
+   #
+   # This is the output from an AIX 6.x system:
+   #
+   # Get the traffic levels on the vscsi# and fcs# devices
+   #
+   #  $ iostat -Dla
+   #  System configuration: lcpu=8 drives=14 paths=28 vdisks=2
+   # Adapter:                      xfers
+   #-------------------- ---------------------------
+   #                        bps    tps  bread  bwrtn
+   # fcs3                 246.0M  322.0  246.0M   0.0
+   # fcs4                 821.0M 1566.0  821.0M   0.0
+   #
+   #Vadapter:                        xfers                                 read                        write                              queue
+   #-------------------- --------------------------------------- -------------------------- -------------------------- --------------------------------------
+   #                       Kbps   tps bkread bkwrtn partition-id   rps    avg    min    max   wps    avg    min    max    avg    min    max   avg   avg  serv
+   #                                                                     serv   serv   serv         serv   serv   serv   time   time   time  wqsz  sqsz qfull
+   #vscsi0                  0.0   2.8    1.7    1.0           91   1.7   1.8    0.0   34.7S   1.0   1.9    0.2    3.3S   0.0    0.0    6.2    0.0   1.0   0.0
+   #vscsi1                  0.0   0.0    0.0    0.0           92   0.0   0.2    0.0    1.7    0.0   9.0M   0.2    1.5S   0.2    0.0    0.0    0.0   0.0   0.0
+   #
+   #
+   open(IN,"$iostat -Dla 1 1 |");                                            #open filehandle using command output
+   while (<IN>) {                                                            #read a line from filehandle
+      next if ( /System configuration/ );                                    #skip header row
+      next if ( /^Disks:/ );                                                 #skip header row
+      #
+      #
+      # find the metrics for physical or virtual fibre channel adapters
+      # The metrics we are interested in are:
+      #    bps - bits per second
+      #    tps - transactions per second
+      #    read avg serv - read latency in milliseconds
+      #    write avg serv - write latency in milliseconds
+      if ( /^fcs[0-9]+/ ) {                                                  #find the line containing a fcs# fibre channel adapter
+         s/ +/ /g;                                                           #collapse multiple spaces into single space
+         @fields = split /\s/,$_;                                            #split the output on whitespace
+         $disk_name     = $fields[0];                                        #assign more mnemonic variable name
+         $MBps          = $fields[1];                                        #assign more mnemonic variable name
+         $iops          = $fields[2];                                        #assign more mnemonic variable name
+         $io{$disk_name}{disk_name}=$disk_name;                              #add value to hash
+         $io{$disk_name}{MBps}=$MBps;                                        #add value to hash
+         $io{$disk_name}{iops}=$iops;                                        #add value to hash
+         $io{$disk_name}{percent_busy}="unknown";                            #fibre channel adapters do not have a %busy attribute, put in a dummy value to avoid undef errors
+         $io{$disk_name}{read_latency}="unknown";                            #FC adapters do not have a read  latency attribute, put in a dummy value to avoid undef errors
+         $io{$disk_name}{write_latency}="unknown";                           #FC adapters do not have a write latency attribute, put in a dummy value to avoid undef errors
+         #
+         #
+         #
+         # fibre channel adapter throughput field (bps) might be displayed in K/M/G/T - convert to bytes
+         if ( $io{$disk_name}{MBps} =~ /K/ ) {                                    #check to see if value is in Kilobytes instead of bytes
+            $io{$disk_name}{MBps} =~ s/K//;                                       #remove the Kilobytes unit of measurement
+            $io{$disk_name}{MBps} = $io{$disk_name}{MBps} * 1000;                      #convert from Kilobytes to bytes so we have consistent values
+         }                                                                   #end of if block
+         if ( $io{$disk_name}{MBps} =~ /M/ ) {                                    #check to see if value is in Megabytes instead of bytes
+            $io{$disk_name}{MBps} =~ s/M//;                                       #remove the Megabytes unit of measurement
+            $io{$disk_name}{MBps} = $io{$disk_name}{MBps} * 1000 * 1000;               #convert from Megabytes to bytes so we have consistent values
+         }                                                                   #end of if block
+         if ( $io{$disk_name}{MBps} =~ /G/ ) {                                    #check to see if value is in Gigabytes instead of bytes
+            $io{$disk_name}{MBps} =~ s/G//;                                       #remove the Gigabytes unit of measurement
+            $io{$disk_name}{MBps} = $io{$disk_name}{MBps} * 1000 * 1000 * 1000;        #convert from Gigabytes to bytes so we have consistent values
+         }                                                                   #end of if block
+         if ( $io{$disk_name}{MBps} =~ /T/ ) {                                    #check to see if value is in Terabytes instead of bytes
+            $io{$disk_name}{MBps} =~ s/T//;                                       #remove the Terabytes unit of measurement
+            $io{$disk_name}{MBps} = $io{$disk_name}{MBps} * 1000 * 1000 * 1000 * 1000; #convert from Terabytes to bytes so we have consistent values
+         }                                                                   #end of if block
+         # At this point, we are confident that the fibre channel adapter throughput is in bytes, so we will now convert to MB/sec
+         if ( $io{$disk_name}{MBps} > 0 ) {                                       #avoid divide by zero errors
+            $io{$disk_name}{MBps} = $io{$disk_name}{MBps} / 1000 / 1000;               #yes, we are dividing by 1000 instead of 1024
+            $io{$disk_name}{MBps}= sprintf("%.2f",$io{$disk_name}{MBps});              #truncate to 2 decimal places
+         }                                                                   #end of if block
+         #
+         print "   adapter_name=$io{$disk_name}{disk_name} MBps=$io{$disk_name}{MBps} iops=$io{$disk_name}{iops}  \n" if ($verbose eq "yes");
+      }                                                                      #end of if block
+      #
+      #
+      # find the metrics for virtual scsi adapters
+      # The metrics we are interested in are:
+      #    bps - bits per second
+      #    tps - transactions per second
+      #    read avg serv - read latency in milliseconds
+      #    write avg serv - write latency in milliseconds
+      if ( /^vscsi[0-9]+/ ) {                                                #find the line containing a virtual scsi adapter
+         s/ +/ /g;                                                           #collapse multiple spaces into single space
+         @fields = split /\s/,$_;                                            #split the output on whitespace
+         $disk_name     = $fields[0];                                        #assign more mnemonic variable name
+         $MBps          = $fields[1];                                        #assign more mnemonic variable name
+         $iops          = $fields[2];                                        #assign more mnemonic variable name
+         $read_latency  = $fields[7];                                        #assign more mnemonic variable name
+         $write_latency = $fields[13];                                       #assign more mnemonic variable name
+         $io{$disk_name}{disk_name}=$disk_name;                              #add value to hash
+         $io{$disk_name}{MBps}=$MBps;                                        #add value to hash
+         $io{$disk_name}{iops}=$iops;                                        #add value to hash
+         $io{$disk_name}{read_latency}=$read_latency;                        #add value to hash
+         $io{$disk_name}{write_latency}=$write_latency;                     #add value to hash
+         $io{$disk_name}{percent_busy}="unknown";                           #virtual scsi adapters do not have a %busy attribute - put in a dummy value to avoid undef errors
+         #
+         # adapter throughput field (Kbps) is listed in Kilobytes per second. Convert to MB/sec
+         if ( $io{$disk_name}{MBps} > 0 ) {                                  #avoid divide by zero errors
+            $io{$disk_name}{MBps} = $io{$disk_name}{MBps} / 1000;            #yes, we are dividing by 1000 instead of 1024
+            $io{$disk_name}{MBps}= sprintf("%.2f",$io{$disk_name}{MBps});    #truncate to 2 decimal places
+         }                                                                   #end of if block
+         #
+         # read/write latency defaults to milliseconds - convert from seconds if necessary
+         if ( $io{$disk_name}{read_latency} =~ /S/ ) {                       #check to see if value is in seconds instead of milliseconds
+            $io{$disk_name}{read_latency} =~ s/S//;                               #remove the seconds unit of measurement
+            $io{$disk_name}{read_latency} = $io{$disk_name}{read_latency} * 1000;      #convert from seconds to milliseconds so we have consistent values
+         }                                                                   #end of if block
+         if ( $io{$disk_name}{write_latency} =~ /S/ ) {                           #check to see if value is in seconds instead of milliseconds
+            $io{$disk_name}{write_latency} =~ s/S//;                              #remove the seconds unit of measurement
+            $io{$disk_name}{write_latency} = $io{$disk_name}{write_latency} * 1000;    #convert from seconds to milliseconds so we have consistent values
+         }                                                                   #end of if block
+         #
+         # AIX sometimes reports bogus latency values when the device has zero traffic.
+         # For example, if the MB/sec and IOPS values are both zero, it might have a bogus latency value of thousands of milliseconds.
+         # Avoid these bogus values by resetting latency to zero if both MB/sec and IOPS are zero.
+         if ( ($io{$disk_name}{MBps} == 0) && ($io{$disk_name}{iops} == 0) ) {
+            $io{$disk_name}{read_latency}  = 0;
+            $io{$disk_name}{write_latency} = 0;
+         }                                                                   #end of if block
+         #
+         #
+         print "   adapter_name=$io{$disk_name}{disk_name} MBps=$io{$disk_name}{MBps} iops=$io{$disk_name}{iops} read_latency=$io{$disk_name}{read_latency}ms write_latency=$io{$disk_name}{write_latency}ms \n" if ($verbose eq "yes");
+      }                                                                      #end of if block
+   }                                                         #end of while loop
+   close IN;                                                 #close filehandle
    #
    #
    #
-   elsif ( $ostype eq "AIX" ) {
-      #
-      # This is the output from an AIX 6.x system:
-      #
-      # System configuration: lcpu=8 drives=15 paths=30 vdisks=2
-      #
-      # Disks:        % tm_act     Kbps      tps    Kb_read   Kb_wrtn
-      # hdisk3           0.1       6.8       0.1   77126083   1404652
-      # hdisk5           0.1       6.7       0.1   76307191    882732
-      # hdisk2           2.9     315.0      12.0   3520527919  127619485
-      # hdisk0           0.8      56.6       4.4   480889742  174546576
-      #
-      open(IN,"$iostat -d|");                                   #open filehandle using command output
+   # Get the metrics for the hdisk devices
+   # output will look similar to:
+   # iostat -Dl 1 1 
+   #  System configuration: lcpu=8 drives=19 paths=124 vdisks=2
+   # Disks:                      xfers                                read                                write                                  queue
+   # --------------- -------------------------------- ------------------------------------ ------------------------------------ --------------------------------------
+   #                   %tm    bps   tps  bread  bwrtn   rps    avg    min    max time fail   wps    avg    min    max time fail    avg    min    max   avg   avg  serv
+   #                   act                                    serv   serv   serv outs              serv   serv   serv outs        time   time   time  wqsz  sqsz qfull
+   # hdisk12          13.0 430.1K  48.0   0.0  430.1K   0.0   0.0    0.0    0.0     0    0  48.0   2.7    0.4   24.3     0    0   0.0    0.0    0.0    0.0   0.0   0.0
+   # hdisk11          65.0  69.2M 132.0  69.2M   0.0  132.0  22.7    1.2   90.4     0    0   0.0   0.0    0.0    0.0     0    0   0.0    0.0    0.0    0.0   3.0   0.0
+   # hdisk14           0.0   0.0    0.0   0.0    0.0    0.0   0.0    0.0    0.0     0    0   0.0   0.0    0.0    0.0     0    0   0.0    0.0    0.0    0.0   0.0   0.0
+   # hdisk29           0.0   0.0    0.0   0.0    0.0    0.0   0.0    0.0    0.0     0    0   0.0   0.0    0.0    0.0     0    0   0.0    0.0    0.0    0.0   0.0   0.0
+   # hdisk9           44.0  64.0M 124.0  64.0M   0.0  124.0  13.1    0.9   40.2     0    0   0.0   0.0    0.0    0.0     0    0   0.0    0.0    0.0    0.0   1.0   0.0
+   # hdisk10          55.0  67.6M 129.0  67.6M   0.0  129.0  12.9    1.2   91.1     0    0   0.0   0.0    0.0    0.0     0    0   0.0    0.0    0.0    0.0   1.0   0.0
+
+   open(IN,"$iostat -Dl 1 1 |");                                             #open filehandle using command output
+   while (<IN>) {                                                            #read a line from filehandle
+      # find the metrics for hdisk devices
+      # Note that this regex looks for "hdisk", so SDD (which uses vpath#) and PowerPath (which uses vdiskpower#) are not supported by this check.
+      if ( /^hdisk[0-9]+/ ) {                                                #find the line containing a virtual scsi adapter
+         s/ +/ /g;                                                           #collapse multiple spaces into single space
+         @fields = split /\s/,$_;                                            #split the output on whitespace
+         $disk_name     = $fields[0];                                        #assign more mnemonic variable name
+         $percent_busy  = $fields[1];                                        #assign more mnemonic variable name
+         $iops          = $fields[3];                                        #assign more mnemonic variable name
+         $MBps          = $fields[2];                                        #assign more mnemonic variable name
+         $read_latency  = $fields[7];                                        #assign more mnemonic variable name
+         $write_latency = $fields[13];                                       #assign more mnemonic variable name
+         $io{$disk_name}{disk_name}=$disk_name;                              #add value to hash
+         $io{$disk_name}{percent_busy}=$percent_busy;                        #add value to hash
+         $io{$disk_name}{iops}=$iops;                                        #add value to hash
+         $io{$disk_name}{MBps}=$MBps;                                        #add value to hash
+         $io{$disk_name}{read_latency}=$read_latency;                        #add value to hash
+         $io{$disk_name}{write_latency}=$write_latency;                      #add value to hash
+         #
+         # disk throughput field (bps) might be displayed in K/M/G/T - convert to bytes
+         if ( $io{$disk_name}{MBps} =~ /K/ ) {                                    #check to see if value is in Kilobytes instead of bytes
+            $io{$disk_name}{MBps} =~ s/K//;                                       #remove the Kilobytes unit of measurement
+            $io{$disk_name}{MBps} = $io{$disk_name}{MBps} * 1000;                      #convert from Kilobytes to bytes so we have consistent values
+         }                                                                   #end of if block
+         if ( $io{$disk_name}{MBps} =~ /M/ ) {                                    #check to see if value is in Megabytes instead of bytes
+            $io{$disk_name}{MBps} =~ s/M//;                                       #remove the Megabytes unit of measurement
+            $io{$disk_name}{MBps} = $io{$disk_name}{MBps} * 1000 * 1000;               #convert from Megabytes to bytes so we have consistent values
+         }                                                                   #end of if block
+         if ( $io{$disk_name}{MBps} =~ /G/ ) {                                    #check to see if value is in Gigabytes instead of bytes
+            $io{$disk_name}{MBps} =~ s/G//;                                       #remove the Gigabytes unit of measurement
+            $io{$disk_name}{MBps} = $io{$disk_name}{MBps} * 1000 * 1000 * 1000;        #convert from Gigabytes to bytes so we have consistent values
+         }                                                                   #end of if block
+         if ( $io{$disk_name}{MBps} =~ /T/ ) {                                    #check to see if value is in Terabytes instead of bytes
+            $io{$disk_name}{MBps} =~ s/T//;                                       #remove the Terabytes unit of measurement
+            $io{$disk_name}{MBps} = $io{$disk_name}{MBps} * 1000 * 1000 * 1000 * 1000; #convert from Terabytes to bytes so we have consistent values
+         }                                                                   #end of if block
+         # At this point, we are confident that the disk throughput is in bytes, so we will now convert to MB/sec
+         if ( $io{$disk_name}{MBps} > 0 ) {                                       #avoid divide by zero errors
+            $io{$disk_name}{MBps} = $io{$disk_name}{MBps} / 1000 / 1000;               #yes, we are dividing by 1000 instead of 1024
+            $io{$disk_name}{MBps}= sprintf("%.2f",$io{$disk_name}{MBps});              #truncate to 2 decimal places
+         }                                                                   #end of if block
+         #
+         # AIX sometimes reports bogus latency values when the device has zero traffic.
+         # For example, if the MB/sec and IOPS values are both zero, it might have a bogus latency value of thousands of milliseconds.
+         # Avoid these bogus values by resetting latency to zero if both MB/sec and IOPS are zero.
+         if ( ($io{$disk_name}{MBps} == 0) && ($io{$disk_name}{iops} == 0) ) {
+            $io{$disk_name}{read_latency}  = 0;
+            $io{$disk_name}{write_latency} = 0;
+         }                                                                   #end of if block
+         #
+         #
+         print "   disk_name=$io{$disk_name}{disk_name} busy=$io{$disk_name}{percent_busy}\% MBps=$io{$disk_name}{MBps} iops=$io{$disk_name}{iops} read_latency=$io{$disk_name}{read_latency}ms write_latency=$io{$disk_name}{write_latency}ms \n" if ($verbose eq "yes");
+      }                                                                      #end of if block
+      if ( /Disk history since boot not available/ ) {
+         print "$CHECK_NAME UNKNOWN - disk accounting is not turned on for this system, so disk stats cannot be determined.  Please enable disk accounting with the following
+mand: chdev -l sys0 -a \"iostat=true\" \n";
+         exit $UNKNOWN;
+      }                                                      #end of if block
+   }                                                         #end of while loop
+   close IN;                                                 #close filehandle
+   #
+   #
+   # Calculate the overall IOPS, MBps, latency averaged across all the disks
+   $total_iops          = 0;					#initiaze variable
+   $total_MBps          = 0;					#initiaze variable
+   $total_read_latency  = 0;					#initiaze variable	
+   $total_write_latency = 0;					#initiaze variable
+   foreach $key (sort keys %io) {
+      $total_iops          = $total_iops          + $io{$key}{iops};
+      $total_MBps          = $total_MBps          + $io{$key}{MBps};
+      $total_read_latency  = $total_read_latency  + $io{$key}{read_latency};
+      $total_write_latency = $total_write_latency + $io{$key}{write_latency};
+   }							#end of foreach loop
+   # iops and MBps are cumulative, but latency should be averaged
+   $count = 0;							#initialize counter variable
+   foreach $key (sort keys %io) {
+      $count++;							#increment counter
+   }								#end of foreach loop
+   $total_read_latency = $total_read_latency / $count;		#average read latency across all disks
+   $total_read_latency = sprintf("%.0f",$total_read_latency);   #truncate to 0 decimal places
+   $total_write_latency = $total_write_latency / $count;	#average write latency across all disks
+   $total_write_latency = sprintf("%.0f",$total_write_latency); #truncate to 0 decimal places
+   #
+   print "   Total_IOPS:$total_iops Total_MBps:$total_MBps Average_read_latency:${total_read_latency}ms Average_write_latency:${total_write_latency}ms \n" if ($verbose eq "yes");
+}                                                            #end of subroutine
+
+
+
+
+
+
+
+
+
+
+sub check_disk_queue_depth_SunOS {
+   #
+   print "running check_disk_queue_depth_SunOS subroutine \n" if ($verbose eq "yes");
+   #
+   #
+   return unless ( $ostype eq "SunOS" );
+   # not implemented - feel free to send patches to the author
+}								#dnd of subroutine
+
+
+
+sub check_disk_queue_depth_HPUX {
+   #
+   print "running check_disk_queue_depth_HPUX subroutine \n" if ($verbose eq "yes");
+   #
+   #
+   return unless ( $ostype eq "HP-UX" );
+   # not implemented - feel free to send patches to the author
+}								#dnd of subroutine
+
+
+
+sub check_disk_queue_depth_FreeBSD {
+   #
+   print "running check_disk_queue_depth_Linux subroutine \n" if ($verbose eq "yes");
+   #
+   #
+   return unless ( $ostype eq "FreeBSD" ); 
+   # not implemented - feel free to send patches to the author
+}								#dnd of subroutine
+
+sub check_disk_queue_depth_MacOS {
+   #
+   print "running check_disk_queue_depth_MacOS subroutine \n" if ($verbose eq "yes");
+   #
+   #
+   return unless ( $ostype eq "MacOS" );
+   # not implemented - feel free to send patches to the author
+}								#dnd of subroutine
+
+
+
+
+sub check_disk_queue_depth_Linux {
+   #
+   print "running check_disk_queue_depth_Linux subroutine \n" if ($verbose eq "yes");
+   #
+   #
+   return unless( $ostype eq "Linux" ); 
+   #
+   # very basic details from Linux - feel free to send patches to the author
+   #
+   # check for Qlogic HBA (not implmeented) 
+   # cat /sys/class/scsi_host/host##/lpfc_lun_queue_depth
+   #
+   # check for Qlogic HBA
+   if ( -e "/sys/module/qla2xxx/parameters/ql2xmaxqdepth" ) {
+      open(IN,"/sys/module/qla2xxx/parameters/ql2xmaxqdepth"); # open file for reading
       while (<IN>) {                                            #read a line from filehandle
-         next if ( /System configuration/ );                    #skip header row
-         next if ( /^Disks:/ );                                 #skip header row
-         # Note that this regex looks for "hdisk", so SDD (which uses vpath#) and PowerPath (which uses vdiskpower#) are not supported by this check.
-         if ( /(hdisk[0-9]+) +([0-9\.]+) +([0-9\.]+) +([0-9\.]+) +([0-9]+) +([0-9\.]+)/ ) {
-            $disk_name    = $1;                                 #assign more mnemonic variable name
-            $percent_busy = $2;                                 #assign more mnemonic variable name
-            $iops         = $4;                                 #assign more mnemonic variable name
-            $MBps         = $3;                                 #assign more mnemonic variable name
-            $MBps         = $MBps / 1024;                       #divide by 1024 to convert Kbps to Mbps
-            $MBps         = $MBps / 8;                          #divide by 8 to convert Mbps to MBps
-            $io{$disk_name}{disk_name}=$disk_name;              #add value to hash
-            $io{$disk_name}{iops}=$iops;                        #add value to hash
-            $io{$disk_name}{MBps}=$MBps;                        #add value to hash
-            $io{$disk_name}{MBps}= sprintf("%.2f",$io{$disk_name}{MBps}); #truncate to 2 decimal places
-            $io{$disk_name}{percent_busy}=$percent_busy;        #add value to hash
-            print "disk_name=$disk_name percent_busy=$percent_busy iops=$iops MBps=$MBps \n" if ($verbose eq "yes");
+         if ( /^([0-9]+)/ ) {                               	#queue depth is an integer common for all Qlogic HBA
+            $fc_adapters{qlogic}{qlogic} = $1;              #add name of fibre channel adapter to hash
+               print "   found qlogic fibre channel adapter queue depth $1 \n" if ($verbose eq "yes");
          }                                                      #end of if block
-         if ( /Disk history since boot not available/ ) { 
-            print "$CHECK_NAME UNKNOWN - disk accounting is not turned on for this system, so disk stats cannot be determined.  Please enable disk accounting with the following command: chdev -l sys0 -a \"iostat=true\" \n";
-            exit( $UNKNOWN );
-         }							#end of if block
       }                                                         #end of while loop
       close IN;                                                 #close filehandle
-   }                                                            #end of if block
+   }
+}								#dnd of subroutine
+
+
+
+
+
+sub check_disk_queue_depth_AIX {
+   #
+   print "running check_disk_queue_depth_AIX subroutine \n" if ($verbose eq "yes");
    #
    #
+   return unless ( $ostype eq "AIX" );
    #
-   else {
-      # send an "unknown" alert because we could not determine the operating system
-      print "$CHECK_NAME UNKNOWN - could not determine operating system from uname output.  Please feel free to update this check and send patches to the author.\n";
-      exit( $UNKNOWN );
-   }								#end of if block
-} 								#end of subroutine
+   # check for fibre channel adapters
+   open(IN,"$lsdev|");                                       #open filehandle using command output
+   while (<IN>) {                                            #read a line from filehandle
+      if ( /^(fcs[0-9]+)/ ) {                                #find fcs# devices (fibre channel adapters)
+         $fc_adapters{$1}{name} = $1;                        #add name of fibre channel adapter to hash
+         print "   found fibre channel adapter $1 \n" if ($verbose eq "yes");
+      }                                                      #end of if block
+   }                                                         #end of while loop
+   close IN;                                                 #close filehandle
+   #
+   #
+   # check the queue depth on each fibre channel adapter
+   foreach $key (sort keys %fc_adapters) {                   #loop through for adapter
+      open (IN,"$lsattr -El $fc_adapters{$key}{name} |");    #open filehandle using command output
+      while (<IN>) {                                         #read a line from filehandle
+         if ( /^num_cmd_elems +([0-9]+)/ ) {                 #find the queue depth on the FC adapter
+            $fc_adapters{$key}{num_cmd_elems} = $1;          #add queue depth to hash
+            print "   FC adapter $fc_adapters{$key}{name} queue depth is $fc_adapters{$key}{num_cmd_elems} \n" if ($verbose eq "yes");
+         }                                                   #end of if block
+      }                                                      #end of while loop
+      close IN;                                              #close filehandle
+   }                                                         #end of foreach block
+   #
+   # Now that we now the queue depth of each fibre channel adapter,
+   # check to see if the actual workload is exceeding that queue depth.
+   # We can do this by checking the "high water mark" for the adapter using the fcstat command.
+   #
+   # This is what sample output will look like:
+   # fcstat -d fcs0
+   #   FC SCSI Adapter Driver Queue Statistics
+   #      Number of active commands:   1
+   #      High water mark  of active commands:   2         <---- this is the line we want
+   #      Number of pending commands:   0
+   #      High water mark of pending commands:   1
+   #      Number of commands in the Adapter Driver Held off queue:  0
+   #      High water mark of number of commands in the Adapter Driver Held off queue:  0
+   #
+   #  FC SCSI Protocol Driver Queue Statistics
+   #    Number of active commands:   1
+   #    High water mark  of active commands:   2          <---- do not accidentally use this line!
+   #    Number of pending commands:   0
+   #    High water mark of pending commands:   1
+   #
+   foreach $key (sort keys %fc_adapters) {                           #loop through for each adapter
+      #
+      # This will be a tricky regex, because there are two identical lines in the output.
+      # Fortunately, we use a little trick to only capture the first instance of the line.
+      #
+      open (IN,"$fcstat -D $fc_adapters{$key}{name} |");             #open filehandle using command output
+      while (<IN>) {                                                 #read a line from filehandle
+         if (/High water mark  of active commands: +([0-9]+)/) {     #find the line with the high water mark
+            unless ($fc_adapters{$key}{high_water_mark}) {           #nifty trick to check to see if the hash element is already defined
+               $fc_adapters{$key}{high_water_mark} = $1;             #assign value to hash
+               print "   FC adapter $fc_adapters{$key}{name} high water mark is $fc_adapters{$key}{high_water_mark} \n" if ($verbose eq "yes");
+            }                                                        #end of unless block
+         }                                                           #end of if block
+      }                                                              #end of while loop
+      close IN;                                                      #close filehandle
+   }                                                                 #end of foreach block
+   #
+   # ensure all the hash elements are initialized so we can do comparisons later
+   foreach $key (sort keys %fc_adapters) {                           #loop through for each adapter
+      unless ($fc_adapters{$key}{num_cmd_elems}) {                   #check to see if the hash element exists
+         $fc_adapters{$key}{num_cmd_elems} = "unknown";              #initialize hash element
+      }                                                              #end of unless block
+      unless ($fc_adapters{$key}{high_water_mark}) {                 #check to see if the hash element exists
+         $fc_adapters{$key}{high_water_mark} = "unknown";            #initialize hash element
+      }                                                              #end of unless block
+   }                                                                 #end of foreach block
+}                                                                       #end of subroutine
 
 
 
 
 
 sub print_output {
+   #
    print "running print_output subroutine \n" if ($verbose eq "yes");
    #
    #
    #
+   $issue_count = 0;						#initialize counter variable
    #
    # The nagios performance data will be the same for all the outputs, so just put it in a variable that can be use by all the output options
    # The format is:  label=value[UOM];[warn];[crit];[min];[max]
@@ -422,16 +904,60 @@ sub print_output {
    }							#end of foreach block
    #
    #
+   # Put total IOPS / MBps / latency at the beginning of the message outpuot
+   if ( $ostype eq "Linux" ) {
+      $common_output_data = "$common_output_data Total_IOPS:$total_iops Total_MBps:$total_MBps Average_latency:${total_latency}ms";
+   }
+   if ( $ostype eq "AIX" ) {
+      $common_output_data = "$common_output_data Total_IOPS:$total_iops Total_MBps:$total_MBps Average_read_latency:${total_read_latency}ms Average_write_latency:${total_write_latency}ms";
+   }
    #
    # Much of the text of the output will be the same.  Put the common stuff in a variable so we can simplify the outputs
    foreach $key (sort keys %io) {       			#loop through for each disk
       next unless $key;                          		#skip any blank lines
       next if  ( $io{$key}{percent_busy} eq "unknown" );	#skip for operating systems that do not track this value
+      if ( $skip_idle_disks eq "yes") {	
+         next if ( $io{$key}{percent_busy} < 5 );		#skip for disks that are less than 5% busy to avoid excessive output
+      }
       $common_output_data = "$common_output_data $io{$key}{disk_name}_iops=$io{$key}{iops} $io{$key}{disk_name}_MBps=$io{$key}{MBps} $io{$key}{disk_name}_busy=$io{$key}{percent_busy}%";
    }							#end of foreach block
    #
    #
-   # See how busy each of the disks are.
+   #
+   # Add the fibre channel adapter queue depth and high water mark to the message output
+   foreach $key (sort keys %fc_adapters) {                      #loop through for each fibre channel adapter
+      next unless $key;                                         #skip any blank lines
+      next unless $fc_adapters{$key}{num_cmd_elems};            #skip undefined  hash elements
+      next unless $fc_adapters{$key}{high_water_mark};          #skip undefined  hash elements
+      next if ( $fc_adapters{$key}{num_cmd_elems}   eq "unknown" );     #skip for operating systems that do not track this value
+      next if ( $fc_adapters{$key}{high_water_mark} eq "unknown" );     #skip for operating systems that do not track this value
+      $common_output_data = "$common_output_data $fc_adapters{$key}{name}_queue_depth=$fc_adapters{$key}{num_cmd_elems} $fc_adapters{$key}{name}_high_water_mark=$fc_adapters{$key}{high_water_mark} ";
+   }                                                    #end of foreach block
+   #
+   #
+   # Send alert for high read/write latency on disks or vscsi adapters
+   # Note that this will alert on the first device that breaches the threshold, and will not
+   # report on additional devices that may also be too busy.
+   #
+   foreach $key (sort keys %io) {                               #loop through for each disk
+      next unless $key;                                         #skip any blank lines
+      next unless $io{$key}{read_latency};                      #skip for operating systems that do not track this value
+      next unless $io{$key}{write_latency};                     #skip for operating systems that do not track this value
+      next if   ( $io{$key}{read_latency}  eq "unknown" );      #skip for operating systems that do not track this value
+      next if   ( $io{$key}{write_latency} eq "unknown" );      #skip for operating systems that do not track this value
+      print "   disk=$io{$key}{disk_name} read_latency=$io{$key}{read_latency}ms write_latency=$io{$key}{write_latency}ms \n" if ($verbose eq "yes");
+      if ( $io{$key}{read_latency} >= $read_latency_threshold ) {
+         $issue_count++;					#increment the counter of problems that will be reported in the output
+         $issues{$issue_count}{description} = "$io{$key}{disk_name} has high read latency $io{$key}{read_latency} milliseconds. ";
+      }                                                         #end of if block
+      if ( $io{$key}{write_latency} >= $write_latency_threshold ) {
+         $issue_count++;					#increment the counter of problems that will be reported in the output
+         $issues{$issue_count}{description} = "$io{$key}{disk_name} has high write latency $io{$key}{read_latency} milliseconds. ";
+      }                                                         #end of if block
+   }                                                            #end of foreach loop
+   #
+   #
+   # Send alert for busy disks
    # Note that this will alert on the first disk that breaches the threshold, and will not
    # report on additional disks that may also be too busy.
    #
@@ -440,15 +966,48 @@ sub print_output {
       next if  ( $io{$key}{percent_busy} eq "unknown" );	#skip for operating systems that do not track this value
       print "   disk=$io{$key}{disk_name} percent_busy=$io{$key}{percent_busy} \n" if ($verbose eq "yes");
       if ( $io{$key}{percent_busy} >= $disk_busy_threshold ) {
-         print "$CHECK_NAME WARN - disk $io{$key}{disk_name} is $io{$key}{percent_busy} \% busy.  This is indicative of a very busy disk.  Disk performance may be a bottleneck.  $common_output_data | $perf_data \n";
-         exit( $WARN );
+         $issue_count++;					#increment the counter of problems that will be reported in the output
+         $issues{$issue_count}{description} = "$io{$key}{disk_name} is $io{$key}{percent_busy}\% busy. ";
       }								#end of if block
    }								#end of foreach loop
    #
+   # NOTE: This section is the only section that does not use the %issues hash to keep track of all issues before alerting.
+   #       The idea is that FC adapters will only very rarely if ever hit the high water mark, so if they do, just alert immediately.
+   # Send alert if the queue depth on the fibre channel adapters is insufficient
+   # Note that this will alert on the first fibre channel adapter that breaches the threshold, and will not
+   # report on additional adapters that may also be too busy.
+   #
+   foreach $key (sort keys %fc_adapters) {                      #loop through for each disk
+      next unless $key;                                         #skip any blank lines
+      next unless ($fc_adapters{$key}{num_cmd_elems}); 		#skip for operating systems that do not track this value
+      next unless ($fc_adapters{$key}{high_water_mark}); 	#skip for operating systems that do not track this value
+      next if ($fc_adapters{$key}{num_cmd_elems}   eq "unknown"); #skip for operating systems that do not track this value
+      next if ($fc_adapters{$key}{high_water_mark} eq "unknown"); #skip for operating systems that do not track this value
+      print "   $fc_adapters{$key}{name} queue_depth=$fc_adapters{$key}{num_cmd_elems}  high_water_mark=$fc_adapters{$key}{high_water_mark} \n" if ($verbose eq "yes");
+      if ( $fc_adapters{$key}{high_water_mark} > $fc_adapters{$key}{num_cmd_elems} ) {
+         print "$CHECK_NAME WARN - adapter $fc_adapters{$key}{disk_name} has a queue depth of $fc_adapters{$key}{num_cmd_elems}, but there has been a high water mark of $fc_adapters{$key}{high_water_mark}.  This means that there have been more SCSI I/O operations in flight than the fibre channel adapter is capable of queueing, which can negatively affect performance.  Please reduce the workload, or increase the queue depth with chdev -l $fc_adapters{$key}{disk_name} -a num_cmd_elems=???  .   $common_output_data | $perf_data \n";
+         exit $WARN;
+      }                                                         #end of if block
+   }                                                            #end of foreach loop
+   #
+   # This section generates alerts for any issues that were found
+   if ( $issue_count > 0 ) {
+      foreach $key (sort keys %issues) {       			#loop through for each issue that was found
+         $common_output_data = "$issues{$key}{description} $common_output_data"; 
+      }								#end of foreach block
+      $common_output_data = "Found $issue_count issues. $common_output_data";
+      print "$CHECK_NAME WARN - $common_output_data | $perf_data  \n";			
+      exit( $WARN );
+   } 								#end of if block
+   #
+   #
+   #
    # We should only get here if there were no problems detected
    #
-   print "$CHECK_NAME OK - $common_output_data | $perf_data  \n";			
-   exit( $OK );
+   if ( $issue_count == 0 ) {
+      print "$CHECK_NAME OK - $common_output_data | $perf_data  \n";			
+      exit( $OK );
+   }							#end of if block
 }                                                       #end of subroutine
 
 
@@ -458,10 +1017,24 @@ sub print_output {
 
 
 
+
+
+
+
 # --------------- main body of program ------------------------------------
+get_options;
+check_operating_system;
 sanity_checks;
-run_iostat;
+run_iostat_SunOS;
+run_iostat_HPUX;
+run_iostat_FreeBSD;
+run_iostat_MacOS;
+run_iostat_Linux;
+run_iostat_AIX;
+check_disk_queue_depth_SunOS;
+check_disk_queue_depth_HPUX;
+check_disk_queue_depth_FreeBSD;
+check_disk_queue_depth_MacOS;
+check_disk_queue_depth_Linux;
+check_disk_queue_depth_AIX;
 print_output;
-
-
-
