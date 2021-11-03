@@ -26,6 +26,7 @@
 #   2021-08-26  njeffrey	Add $count variable, throw away the first iostat record on Linux
 #   2021-08-26  njeffrey	Break out run_iostat subroutine into separate subroutines for each operating system
 #   2021-08-26  njeffrey	For Linux DM-Multipath environment, suppress output for /dev/sd?? paths, only show dm-???
+#   2021-11-02  njeffrey	Bug fix in regex detecting AIX hdisk IOPS
 
 
 
@@ -703,6 +704,8 @@ mand: chdev -l sys0 -a \"iostat=true\" \n";
    $total_read_latency  = 0;					#initiaze variable	
    $total_write_latency = 0;					#initiaze variable
    foreach $key (sort keys %io) {
+      next unless ( $io{$key}{disk_name} =~ /hdisk/ );		#only check hdisk devices for IOPS/MBps/latency - skip fcs devices
+      print "   $io{$key}{disk_name} read_latency:$io{$key}{read_latency} write_latency:$io{$key}{write_latency} \n" if ($verbose eq "yes");
       $total_iops          = $total_iops          + $io{$key}{iops};
       $total_MBps          = $total_MBps          + $io{$key}{MBps};
       $total_read_latency  = $total_read_latency  + $io{$key}{read_latency};
@@ -822,7 +825,7 @@ sub check_disk_queue_depth_AIX {
    #
    # check the queue depth on each fibre channel adapter
    foreach $key (sort keys %fc_adapters) {                   #loop through for adapter
-      open (IN,"$lsattr -El $fc_adapters{$key}{name} |");    #open filehandle using command output
+      open (IN,"$lsattr -El $fc_adapters{$key}{name} 2>&1|");    #open filehandle using command output
       while (<IN>) {                                         #read a line from filehandle
          if ( /^num_cmd_elems +([0-9]+)/ ) {                 #find the queue depth on the FC adapter
             $fc_adapters{$key}{num_cmd_elems} = $1;          #add queue depth to hash
@@ -857,7 +860,7 @@ sub check_disk_queue_depth_AIX {
       # This will be a tricky regex, because there are two identical lines in the output.
       # Fortunately, we use a little trick to only capture the first instance of the line.
       #
-      open (IN,"$fcstat -D $fc_adapters{$key}{name} |");             #open filehandle using command output
+      open (IN,"$fcstat -D $fc_adapters{$key}{name} 2>&1|");             #open filehandle using command output
       while (<IN>) {                                                 #read a line from filehandle
          if (/High water mark  of active commands: +([0-9]+)/) {     #find the line with the high water mark
             unless ($fc_adapters{$key}{high_water_mark}) {           #nifty trick to check to see if the hash element is already defined
