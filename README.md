@@ -12,7 +12,7 @@ All parameters are optional, defaults to --busy=40 --latency=30 for all disk dev
     check_disk_io --verbose
     check_disk_io --help
     check_disk_io --busy=##                     #warn if disk percent busy is >=  ## (defaults to 40)
-    /check_disk_io --latency=##                  #warn if disk latency      is >=  ## milliseconds (defaults to 30)
+    check_disk_io --latency=##                  #warn if disk latency      is >=  ## milliseconds (defaults to 30)
     check_disk_io --exclude=hdisk7,hdisk8       #example disk exclusion for AIX    (does not support wildcards)
     check_disk_io --exclude=sda,sdb,dm-0        #example disk exclusion for Linux  (does not support wildcards)
     check_disk_io --include=device1,device2     #example disk inclusion, only report on these disks (does not support wildcards)
