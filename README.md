@@ -6,7 +6,7 @@ Tested on AIX, FreeBSD, Linux, MacOS.
 Not tested on SunOS, HPUX, OpenBSD, NetBSD, but will likely work with minor updates.
 
 # Usage
-All parameters are optional, defaults to --busy=40 --latency=40 for all disk devices.
+All parameters are optional, defaults to --busy=40 --latency=30 for all disk devices.
 ```
     check_disk_io
     check_disk_io --verbose
