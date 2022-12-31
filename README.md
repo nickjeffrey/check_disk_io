@@ -14,6 +14,7 @@ Not tested on SunOS, HPUX, OpenBSD, NetBSD, but will likely work with minor upda
     ./check_disk_io --latency=##                  #warn if disk latency      is >=  ## milliseconds (defaults to 30)
     ./check_disk_io --exclude=hdisk7,hdisk8       #example disk exclusion for AIX    (does not support wildcards)
     ./check_disk_io --exclude=sda,sdb,dm-0        #example disk exclusion for Linux  (does not support wildcards)
+    ./check_disk_io --include=device1,device2     #example disk inclusion, only report on these disks (does not support wildcards)
 ```
 
 This script is executed remotely on a monitored system by the NRPE or check_by_ssh methods available in nagios.
