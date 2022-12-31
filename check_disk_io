@@ -158,6 +158,12 @@ sub get_options {
       $exclude = $opt_x;
       print "   setting device exclusion to $exclude \n" if ($verbose eq "yes");
    }                                                    #end of if block
+   #
+   # see if user provided both --include=device1,device2 --exclude=device3,device4
+   if ( (defined($opt_i)) && (defined($opt_x)) ) {
+      print "ERROR: The --include and --exclude parameters are mutually exclusive \n";
+      exit $UNKNOWN;
+   }                                                    #end of if block
 }                       #end of subroutine
 
 
