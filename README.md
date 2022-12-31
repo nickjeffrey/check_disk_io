@@ -5,6 +5,17 @@ Tested on AIX, FreeBSD, Linux, MacOS.
 
 Not tested on SunOS, HPUX, OpenBSD, NetBSD, but will likely work with minor updates.
 
+# Usage
+```
+    ./check_disk_io
+    ./check_disk_io --verbose
+    ./check_disk_io --help
+    ./check_disk_io --busy=##                     #warn if disk percent busy is >=  ## (defaults to 40)
+    ./check_disk_io --latency=##                  #warn if disk latency      is >=  ## milliseconds (defaults to 30)
+    ./check_disk_io --exclude=hdisk7,hdisk8       #example disk exclusion for AIX    (does not support wildcards)
+    ./check_disk_io --exclude=sda,sdb,dm-0        #example disk exclusion for Linux  (does not support wildcards)
+```
+
 This script is executed remotely on a monitored system by the NRPE or check_by_ssh methods available in nagios.
 
 If you are using the check_by_ssh method, you will need a section in the services.cfg file on the nagios server that looks similar to the following. This assumes that you already have ssh key pairs configured.
