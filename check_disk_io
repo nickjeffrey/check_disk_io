@@ -29,6 +29,7 @@
 #   2021-08-26  njeffrey	For Linux DM-Multipath environment, suppress output for /dev/sd?? paths, only show dm-???
 #   2021-11-02  njeffrey	Bug fix in regex detecting AIX hdisk IOPS
 #   2022-12-30  njeffrey	Add --exclude= parameter
+#   2023-10-02  njeffrey	Refactor check_iostat_Linux subroutine to use JSON output 
 
 
 
@@ -68,6 +69,7 @@ my (@fields,%fc_adapters,$skip_idle_disks);
 my ($count,$issue_count,%issues,$cmd);
 my ($opt_h,$opt_v,$opt_i,$opt_x,$opt_b,$opt_l);
 my ($total_iops,$total_MBps,$total_latency,$total_read_latency,$total_write_latency,$exclude,$include);
+
 # define variables
 $iostat              = "/usr/bin/iostat";                            	#location of iostat binary
 $fcstat              = "/usr/bin/fcstat";                            	#location of fcstat binary on AIX systems
@@ -98,6 +100,8 @@ $OK=            0;                              			#this script returns a value 
 $WARN=          1;                              			#this script returns a value to nagios for processing
 $CRITICAL=      2;                              			#this script returns a value to nagios for processing
 $UNKNOWN=       3;                              			#this script returns a value to nagios for processing
+
+
 
 
 sub get_options {
@@ -168,6 +172,7 @@ sub get_options {
 
 
 
+
 sub check_operating_system {
    #
    print "running check_operating_system subroutine \n" if ($verbose eq "yes");
@@ -222,6 +227,7 @@ sub sanity_checks {
 
 
 
+
 sub run_iostat_SunOS {
    #
    print "running run_iostat_SunOS subroutine \n" if ($verbose eq "yes");
@@ -235,7 +241,7 @@ sub run_iostat_SunOS {
 
 
 
-   #
+   
 sub run_iostat_HPUX {
    #
    print "running run_iostat_HPUX subroutine \n" if ($verbose eq "yes");
@@ -305,12 +311,8 @@ sub run_iostat_FreeBSD {
 }								#end of subroutine
 
 
-
-
-
    
   
- 
 sub run_iostat_MacOS {
    #
    print "running run_iostat_MacOS subroutine \n" if ($verbose eq "yes");
@@ -392,10 +394,6 @@ sub run_iostat_MacOS {
 
 
 
-
-
-
-
 sub run_iostat_Linux {
    #
    print "running run_iostat_Linux subroutine \n" if ($verbose eq "yes");
@@ -403,69 +401,194 @@ sub run_iostat_Linux {
    #
    return unless ( $ostype eq "Linux" ); 	#break out of subroutine unless operating system is Linux
    #
-   # This is the output of "iostat -d -x -m" from a Linux system.  Note that the -x switch is only supported on 2.5+ kernels
-   # Linux 2.6.18-164.15.1.el5 (rhel01.example.com)  10/18/2010
+   # NOTES:  SCSI        disks  use this naming format: /dev/sda   /dev/sdb   /dev/sdc
+   #         SATA        disks  use this naming format: /dev/sda   /dev/sdb   /dev/sdc
+   #         IDE         disks  use this naming format: /dev/hda   /dev/hdb   /dev/hdc
+   #         KVM virtual disks  use this naming format: /dev/vda   /dev/vdb   /dev/vdc
+   #         Floppy      disks  use this naming format: /dev/fd0   /dev/fd1   /dev/fd2
+   #         SCSI        CDROMs use this naming format: /dev/scd0  /dev/scd1  /dev/scd2
+   #         SATA        CDROMs use this naming format: /dev/sr0   /dev/sr1   /dev/sr2
+   #         Disk-Multipath     use this naming format: /dev/dm-0  /dev/dm-1  /dev/dm-2
+   #         Raspberry Pi SD card uses this format:     /dev/mmcblk0             
    #
-   # Device:         rrqm/s   wrqm/s   r/s   w/s    rMB/s    wMB/s avgrq-sz avgqu-sz   await  svctm  %util
-   # sda               0.04     7.04  0.07  3.44     0.00     0.04    24.40     0.02    5.33   0.39   0.14
-   # sda1              0.00     0.00  0.00  0.00     0.00     0.00    17.46     0.00    3.21   2.70   0.00
-   # sda2              0.03     7.04  0.07  3.44     0.00     0.04    24.40     0.02    5.33   0.39   0.14
-   # dm-0              0.00     0.00  0.11 10.48     0.00     0.04     8.10     0.04    3.95   0.13   0.14
-   # dm-1              0.00     0.00  0.00  0.00     0.00     0.00     8.00     0.00    4.20   0.30   0.00
-   # mmcblk0           0.00     0.00  0.00  0.00     0.00     0.00     8.00     0.00    4.20   0.30   0.00   <--- this is an SD card on a Raspberry Pi
+   # This is the output of "iostat -d -x -m -o JSON" from a Linux system.  Note that the -x switch is only supported on 2.5+ kernels
+   # Please note that we intentionally use JSON output because different versions of Ubuntu/Debian/RHEL/CentOS have slightly different column headers, making the regex unique for different Linux flavours
+   #
+   # # iostat -d -x -m 1 2 -o JSON
+   #  {"sysstat": {
+   #      "hosts": [
+   #         {
+   #            "nodename": "pxe",
+   #            "sysname": "Linux",
+   #            "release": "5.14.0-368.el9.x86_64",
+   #            "machine": "x86_64",
+   #            "number-of-cpus": 2,
+   #            "date": "2023-10-01",
+   #            "statistics": [
+   #               {
+   #                  "disk": [
+   #                     {"disk_device": "dm-0", "r/s": 0.27, "w/s": 0.35, "d/s": 0.00, "f/s": 0.00, "rMB/s": 0.01, "wMB/s": 0.00, "dMB/s": 0.00, "svctm": 0.00, "util": 0.04},
+   #                     {"disk_device": "dm-1", "r/s": 0.00, "w/s": 0.00, "d/s": 0.00, "f/s": 0.00, "rMB/s": 0.00, "wMB/s": 0.00, "dMB/s": 0.00, "svctm": 0.00, "util": 0.00},
+   #                     {"disk_device": "dm-2", "r/s": 1.22, "w/s": 0.08, "d/s": 0.00, "f/s": 0.00, "rMB/s": 0.14, "wMB/s": 0.13, "dMB/s": 0.00, "svctm": 0.05, "util": 0.20},
+   #                     {"disk_device": "sda",  "r/s": 1.22, "w/s": 0.12, "d/s": 0.00, "f/s": 0.00, "rMB/s": 0.14, "wMB/s": 0.13, "dMB/s": 0.00, "svctm": 0.09, "util": 0.28},
+   #                     {"disk_device": "sdb",  "r/s": 0.28, "w/s": 0.29, "d/s": 0.00, "f/s": 0.00, "rMB/s": 0.01, "wMB/s": 0.00, "dMB/s": 0.00, "svctm": 0.00, "util": 0.04}
+   #                  ]
+   #               },
+   #               {
+   #                  "disk": [
+   #                     {"disk_device": "dm-0", "r/s": 0.00, "w/s": 0.00, "d/s": 0.00, "f/s": 0.00, "rMB/s": 0.00, "wMB/s": 0.00, "dMB/s": 0.00, "svctm": 0.00, "util": 0.00},
+   #                     {"disk_device": "dm-1", "r/s": 0.00, "w/s": 0.00, "d/s": 0.00, "f/s": 0.00, "rMB/s": 0.00, "wMB/s": 0.00, "dMB/s": 0.00, "svctm": 0.00, "util": 0.00},
+   #                     {"disk_device": "dm-2", "r/s": 0.00, "w/s": 0.00, "d/s": 0.00, "f/s": 0.00, "rMB/s": 0.00, "wMB/s": 0.00, "dMB/s": 0.00, "svctm": 0.00, "util": 0.00},
+   #                     {"disk_device": "sda",  "r/s": 0.00, "w/s": 0.00, "d/s": 0.00, "f/s": 0.00, "rMB/s": 0.00, "wMB/s": 0.00, "dMB/s": 0.00, "svctm": 0.00, "util": 0.00},
+   #                     {"disk_device": "sdb",  "r/s": 0.00, "w/s": 0.00, "d/s": 0.00, "f/s": 0.00, "rMB/s": 0.00, "wMB/s": 0.00, "dMB/s": 0.00, "svctm": 0.00, "util": 0.00}
+   #                  ]
+   #               }
+   #            ]
+   #         }
+   #      ]
+   #  }}
    #
    #
-   # NOTES:  SCSI   disks use this naming format:  /dev/sda  /dev/sdb  /dev/sdc
-   #         SATA   disks use this naming format:  /dev/sda  /dev/sdb  /dev/sdc
-   #         IDE    disks use this naming format:  /dev/hda  /dev/hdb  /dev/hdc
-   #         Floppy disks use this naming format:  /dev/fd0  /dev/fd1  /dev/fd2
-   #         SCSI CDROMs  use this naming format:  /dev/scd0 /dev/scd1 /dev/scd2
-   #         SATA CDROMs  use this naming format:  /dev/sr0  /dev/sr1  /dev/sr2
-   #         Raspberry Pi SD card uses this format:    /dev/mmcblk0             <---- this is the only device name we use containing a number
+   #
+   # Define a temporary array and hash used only inside this subroutine
+   my (%temp_hash,@temp_array);  #for linux subroutine, please tidy up
    #
    # Get the average of ten iostat iterations, to avoid false alarms when the very first iteration is unusually high
    # The first time iostat is run, it sometimes returns a ridiculously high number that throws off the averages.
-   # Run 11 iterations of iostat, but throw away the first value
+   # Run 11 iterations of iostat, but throw away the first value, leaving us with 10 readings to average.
    $count = 0;												#initialize counter variable
-   $cmd = "iostat -d -x -m 1 11";									#define command to be run
+   $cmd = "iostat -d -x -m 1 11 -o JSON";								#define command to be run
    print "   running command: $cmd \n" if ($verbose eq "yes");
    open(IN,"$cmd |");                        								#open filehandle using command output
    while (<IN>) {                                            						#read a line from filehandle
-      # We only want to monitor entire disks, not slices or partitions
-      $count++ if (/^Device:/);										#increment counter variable each time iostat runs
-      print "   count=$count \n" if ($verbose eq "yes");
-      next if ( /^sd[a-z]+[0-9]/ );									#skip SCSI / SATA disk partitions (sda0, sda1, sdb3, etc)
-      next if ( /^hd[a-z]+[0-9]/ );									#skip IDE         disk partitions (hda0, hda1, hdb3, etc)
-      #next if ( /^dm\-[0-9]/ );									#skip Linux DM disk multipath devices (dm-0, dm-1, etc)
-      next if ( /^sr[0-9]/ );										#skip CDROM  drives  (sr0, sr1, etc)
-      next if ( /^scd[0-9]/ );										#skip CDROM  drives  (scd0, scd1, etc)
-      next if ( /^fd[0-9]/ );										#skip floppy drives  (fd0, fd1, etc)
-      if ( /([a-zA-Z0-9\-]+) +([0-9\.]+) +([0-9\.]+) +([0-9\.]+) +([0-9\.]+) +([0-9\.]+) +([0-9\.]+) +([0-9\.]+) +([0-9\.]+) +([0-9\.]+) +([0-9\.]+) +([0-9\.]+)/ ) {
-         next if ( $count == 1 );									#throw away the first value that is sometimes an outlier
-         $disk_name    = $1;                                 						#assign more mnemonic variable name
-         $iops         = $4 + $5;                            						#add reads/sec and writes/sec to get total iops
-         $MBps         = $6 + $7;                            						#add rMB/s and wMB/s to get total MB/s
-         $percent_busy = $12;                                						#%util column
-         $latency      = $11;                                						#svctm column total latency, not split into read / write
+      s/"//g;                                      							#clean up regex by removing " quotation marks
+      s/ //g;                                      							#clean up regex by removing spaces
+      s/\t//g;                                      							#clean up regex by removing tab characters
+      s/^{//g;                                      							#clean up regex by removing { characters from beginning of line
+      s/}$//g;                                      							#clean up regex by removing } characters from end       of line
+      s/^,$//g;                                      							#clean up regex by removing lines that contain only a comma
+      s/^]$//g;                                      							#clean up regex by removing lines that contain only a ] closing square bracket
+      s/},$//g;                                      							#clean up regex by removing }, from end of line
+      s/^$//g;                                      							#clean up regex by removing blank lines
+      s/,r\/s:/,iops_r:/g; 										#clean up regex by changing r/s:   to iops_r:                      (eliminate / from regex match)
+      s/,w\/s:/,iops_w:/g; 										#clean up regex by changing w/s:   to iops_w:                      (eliminate / from regex match)
+      s/,rMB\/s:/,MBps_r:/g; 										#clean up regex by changing rMB/s: to MBps_r:                      (eliminate / from regex match)
+      s/,wMB\/s:/,MBps_w:/g; 										#clean up regex by changing wMB/s: to MBps_w:                      (eliminate / from regex match)
+      s/\//_/g; 											#clean up regex by changing any / character in column headers to ? (eliminate / from regex match)
+      next if (/^sysstat:/);				 						#skip header line
+      next if (/^hosts:/);				 						#skip header line
+      next if (/^nodename:/);				 						#skip header line
+      next if (/^release:/);				 						#skip header line
+      next if (/^machine:/);				 						#skip header line
+      next if (/^number-of-cpus:/);			 						#skip header line
+      next if (/^date:/);				 						#skip header line
+      next if (/^statistics:/);				 						#skip header line
+      #
+      # At this point, the output for each iostat iteration should look similar to the following:
+      #
+      #disk:[
+      #disk_device:loop0,r/s:0.00,w/s:0.00,rMB/s:0.00,wMB/s:0.00,rrqm/s:0.00,wrqm/s:0.00,rrqm:0.00,wrqm:0.00,r_await:0.00,w_await:0.00,aqu-sz:0.00,rareq-sz:1.00,wareq-sz:0.00,svctm:0.00,util:0.00
+      #disk_device:sda,r/s:1.28,w/s:2.27,rMB/s:0.02,wMB/s:0.03,rrqm/s:0.10,wrqm/s:1.18,rrqm:7.23,wrqm:34.22,r_await:0.44,w_await:3.06,aqu-sz:0.01,rareq-sz:15.34,wareq-sz:11.36,svctm:0.21,util:0.07
+      #disk_device:sdb,r/s:4.84,w/s:0.78,rMB/s:0.58,wMB/s:0.56,rrqm/s:0.00,wrqm/s:0.07,rrqm:0.a01,wrqm:8.38,r_await:0.56,w_await:988.37,aqu-sz:0.77,rareq-sz:122.67,wareq-sz:744.07,svctm:1.67,util:0.94
+      #disk_device:dm-0,r/s:4.84,w/s:0.85,rMB/s:0.58,wMB/s:0.93,rrqm/s:0.00,wrqm/s:0.00,rrqm:0.00,wrqm:0.00,r_await:0.58,w_await:919.74,aqu-sz:0.78,rareq-sz:122.67,wareq-sz:1123.92,svctm:1.65,util:0.94
+      #disk_device:dm-1,r/s:1.36,w/s:3.43,rMB/s:0.02,wMB/s:0.03,rrqm/s:0.00,wrqm/s:0.00,rrqm:0.00,wrqm:0.00,r_await:0.54,w_await:2.76,aqu-sz:0.01,rareq-sz:14.30,wareq-sz:8.86,svctm:0.15,util:0.07
+      #disk_device:dm-2,r/s:0.01,w/s:0.02,rMB/s:0.00,wMB/s:0.00,rrqm/s:0.00,wrqm/s:0.00,rrqm:0.00,wrqm:0.00,r_await:0.79,w_await:4.53,aqu-sz:0.00,rareq-sz:5.88,wareq-sz:4.00,svctm:0.88,util:0.00
+      #
+      #disk:[
+      #disk_device:loop0,r/s:0.00,w/s:0.00,rMB/s:0.00,wMB/s:0.00,rrqm/s:0.00,wrqm/s:0.00,rrqm:0.00,wrqm:0.00,r_await:0.00,w_await:0.00,aqu-sz:0.00,rareq-sz:0.00,wareq-sz:0.00,svctm:0.00,util:0.00
+      #disk_device:sda,r/s:0.00,w/s:0.00,rMB/s:0.00,wMB/s:0.00,rrqm/s:0.00,wrqm/s:0.00,rrqm:0.00,wrqm:0.00,r_await:0.00,w_await:0.00,aqu-sz:0.00,rareq-sz:0.00,wareq-sz:0.00,svctm:0.00,util:0.00
+      #disk_device:sdb,r/s:0.00,w/s:0.00,rMB/s:0.00,wMB/s:0.00,rrqm/s:0.00,wrqm/s:0.00,rrqm:0.00,wrqm:0.00,r_await:0.00,w_await:0.00,aqu-sz:0.00,rareq-sz:0.00,wareq-sz:0.00,svctm:0.00,util:0.00
+      #disk_device:dm-0,r/s:0.00,w/s:0.00,rMB/s:0.00,wMB/s:0.00,rrqm/s:0.00,wrqm/s:0.00,rrqm:0.00,wrqm:0.00,r_await:0.00,w_await:0.00,aqu-sz:0.00,rareq-sz:0.00,wareq-sz:0.00,svctm:0.00,util:0.00
+      #disk_device:dm-1,r/s:0.00,w/s:0.00,rMB/s:0.00,wMB/s:0.00,rrqm/s:0.00,wrqm/s:0.00,rrqm:0.00,wrqm:0.00,r_await:0.00,w_await:0.00,aqu-sz:0.00,rareq-sz:0.00,wareq-sz:0.00,svctm:0.00,util:0.00
+      #disk_device:dm-2,r/s:0.00,w/s:0.00,rMB/s:0.00,wMB/s:0.00,rrqm/s:0.00,wrqm/s:0.00,rrqm:0.00,wrqm:0.00,r_await:0.00,w_await:0.00,aqu-sz:0.00,rareq-sz:0.00,wareq-sz:0.00,svctm:0.00,util:0.00
+      #
+      #
+      # The current contents of the $_ variable is nicely formatted comma-separated key-value pairs of key1:value1,key2:value2,key3:value3
+      # However, different Linux distros put the columns in slightly different order, or have slightly different column names, which means we can not use a simple regex to parse out the fields we want.
+      #
+      #
+      if (/^disk:/) {											#this value indicates the beginning of a new iostat iteration
+         $count++; 											#increment counter variable each time iostat runs a new iteration
+         print "   count=$count \n" if ($verbose eq "yes");
+      }
+      if ($count == 1) {
+         print "   skipping the first iostat iteration because it can give wildly inaccurate values \n" if ($verbose eq "yes");
+      }
+      next unless ($count > 1);										#skip to next iostat iteration because the first values can be wildly inaccurate
+      #
+      #
+      # now read a line that looks similar to one of the following:  (one line per disk device) and put each line in a temporary hash to split out the key:value pairs
+      #disk_device:sda,r/s:0.00,w/s:0.00,rMB/s:0.00,wMB/s:0.00,rrqm/s:0.00,wrqm/s:0.00,rrqm:0.00,wrqm:0.00,r_await:0.00,w_await:0.00,aqu-sz:0.00,rareq-sz:0.00,wareq-sz:0.00,svctm:0.00,util:0.00
+      #disk_device:sdb,r/s:0.00,w/s:0.00,rMB/s:0.00,wMB/s:0.00,rrqm/s:0.00,wrqm/s:0.00,rrqm:0.00,wrqm:0.00,r_await:0.00,w_await:0.00,aqu-sz:0.00,rareq-sz:0.00,wareq-sz:0.00,svctm:0.00,util:0.00
+      # 
+      if (/^disk_device:/) {
+         #print "   found line: $_  \n" if ($verbose eq "yes");
+         @temp_array = split(',', $_);	#split string into array elements made of key:value pairs
+         #print "temp_array is: @temp_array \n" if ($verbose eq "yes");
+         
+         foreach (@temp_array) {							#loop through each comma-separated element in the array
+            if (/([a-zA-Z0-9_\.\-]+):([a-zA-Z0-9_\.\-]+)/) {				#find a key:value pair separated by a colon
+               $temp_hash{$1} = $2;							#split the key:value pairs in the array into hash key:value 
+               #print "   Creating temporary hash key:value pair of $1:$2 \n" if ($verbose eq "yes");
+            }										#end of if block
+         }										#end of foreach loop
          #
+         #
+         # we now have a single line of iostat output in a hash that looks similar to:
+         # %temp_hash =>  disk_device => sda
+         #                iops_r      => 0.00
+         #                iops_w      => 0.00
+         #                MBps_r      => 0.00
+         #                MBps_w      => 0.00
+         #                svctm       => 0.00
+         #                r_await     => 0.00
+         #                w_await     => 0.00
+         #
+         # pull out the interesting values from the %temp_hash
+         $disk_name    = $temp_hash{disk_device};
+         #
+         $iops         = 0;								#initialize variable
+         $iops         = $iops + $temp_hash{iops_r} if ($temp_hash{iops_r}); 		#read IOPS plus write IOPS
+         $iops         = $iops + $temp_hash{iops_w} if ($temp_hash{iops_w}); 		#read IOPS plus write IOPS
+         #
+         $MBps         = 0;								#initialize variable
+         $MBps         = $MBps + $temp_hash{MBps_r} if ($temp_hash{MBps_r}); 		#read MBPS plus write MBPS
+         $MBps         = $MBps + $temp_hash{MBps_w} if ($temp_hash{MBps_w}); 		#read MBPS plus write MBPS
+         #
+         $percent_busy = 0;								#initialize variable
+         $percent_busy = $temp_hash{util} if ($temp_hash{util});  	
+         #
+         $latency      = 0;								#initialize variable
+         $latency      = $latency + $temp_hash{svctm}   if ($temp_hash{svctm});    	#some Linux distros use svctm, some use r_await and w_await
+         $latency      = $latency + $temp_hash{r_await} if ($temp_hash{r_await});  	#some Linux distros use svctm, some use r_await and w_await
+         $latency      = $latency + $temp_hash{w_await} if ($temp_hash{w_await});  	#some Linux distros use svctm, some use r_await and w_await
+         #
+         #
+         #
+         # Now we have pulled out the interesting values for a single disk from the temporary hash.  
+         # We will now put those values in a more permanent hash, using the disk device name as the hash key.
          # initialize hash elements if they do not already exist
-         $io{$disk_name}{iops}=0         unless $io{$disk_name}{iops};
-         $io{$disk_name}{MBps}=0         unless $io{$disk_name}{MBps};
-         $io{$disk_name}{percent_busy}=0 unless $io{$disk_name}{percent_busy};
-         $io{$disk_name}{latency}=0      unless $io{$disk_name}{latency};
+         $disk_name = "unknown" unless $disk_name;
+         $io{$disk_name}{disk_name}    = $disk_name;
+         $io{$disk_name}{iops}         =0 unless $io{$disk_name}{iops};
+         $io{$disk_name}{MBps}         =0 unless $io{$disk_name}{MBps};
+         $io{$disk_name}{percent_busy} =0 unless $io{$disk_name}{percent_busy};
+         $io{$disk_name}{latency}      =0 unless $io{$disk_name}{latency};
          #
-         # Running total of IOPS and MB/second and percent busy
-         $io{$disk_name}{disk_name}     = $disk_name;                                         		#add value to hash
-         $io{$disk_name}{iops}          = $io{$disk_name}{iops} + $iops;                      		#running total of IOPS
-         $io{$disk_name}{MBps}          = $io{$disk_name}{MBps} + $MBps;                      		#running total of MBps
-         $io{$disk_name}{percent_busy}  = $io{$disk_name}{percent_busy} + $percent_busy;      		#running total of % busy
-         $io{$disk_name}{latency}       = $io{$disk_name}{latency} + $latency;      	       		#running total of svctm
-         print "   Running Total: disk_name=$disk_name percent_busy=$percent_busy iops=$iops MBps=$MBps latency=${latency}ms \n" if ($verbose eq "yes");
-      }                                                      						#end of if block
-   }                                                         						#end of while loop
-   close IN;                                                 						#close filehandle
+         #
+         # append a running total of readings for each iteration of iostat output
+         #
+         $io{$disk_name}{iops}         = $io{$disk_name}{iops}         + $iops;
+         $io{$disk_name}{MBps}         = $io{$disk_name}{MBps}         + $MBps;
+         $io{$disk_name}{percent_busy} = $io{$disk_name}{percent_busy} + $percent_busy;	
+         $io{$disk_name}{latency}      = $io{$disk_name}{latency}      + $latency;	
+         print "   disk_name=$disk_name iops=$io{$disk_name}{iops} MBps=$io{$disk_name}{MBps} latency=$io{$disk_name}{latency} percent_busy=$io{$disk_name}{percent_busy} \n" if ($verbose eq "yes");
+      }											#end of if block
+   }                                         						#end of while loop
    #
-   ## At this point, we have a running total of 10 iostat iterations.
+   #
+   #
+   # At this point, we have a running total of 10 iostat iterations for each physical disk device (actually 11 iterations but we ignored the first iteration)
    # Now calculate the average by dividing by 10
    foreach $key (sort keys %io) {                               					#loop through for each disk
       $io{$key}{iops} =         $io{$key}{iops}         / 10;        					#divide by 10 to get average
@@ -520,11 +643,6 @@ sub run_iostat_Linux {
    #
    print "   Total_IOPS:$total_iops Total_MBps:$total_MBps Average_latency:${total_latency}ms \n" if ($verbose eq "yes");
 }													#end of subroutine
-
-
-
-
-
 
 
 
@@ -769,12 +887,6 @@ mand: chdev -l sys0 -a \"iostat=true\" \n";
 
 
 
-
-
-
-
-
-
 sub check_disk_queue_depth_SunOS {
    #
    print "running check_disk_queue_depth_SunOS subroutine \n" if ($verbose eq "yes");
@@ -783,6 +895,7 @@ sub check_disk_queue_depth_SunOS {
    return unless ( $ostype eq "SunOS" );
    # not implemented - feel free to send patches to the author
 }								#dnd of subroutine
+
 
 
 
@@ -797,6 +910,7 @@ sub check_disk_queue_depth_HPUX {
 
 
 
+
 sub check_disk_queue_depth_FreeBSD {
    #
    print "running check_disk_queue_depth_Linux subroutine \n" if ($verbose eq "yes");
@@ -805,6 +919,9 @@ sub check_disk_queue_depth_FreeBSD {
    return unless ( $ostype eq "FreeBSD" ); 
    # not implemented - feel free to send patches to the author
 }								#dnd of subroutine
+
+
+
 
 sub check_disk_queue_depth_MacOS {
    #
@@ -842,7 +959,6 @@ sub check_disk_queue_depth_Linux {
       close IN;                                                 #close filehandle
    }
 }								#dnd of subroutine
-
 
 
 
@@ -941,6 +1057,7 @@ sub remove_excluded_devices {
       delete $io{$exclude};						#delete from hash
    }
 }                                                                       #end of subroutine
+
 
 
 
@@ -1126,14 +1243,6 @@ sub print_output {
       exit( $OK );
    }							#end of if block
 }                                                       #end of subroutine
-
-
-
-
-
-
-
-
 
 
 
