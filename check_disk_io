@@ -29,7 +29,7 @@
 #   2021-08-26  njeffrey	For Linux DM-Multipath environment, suppress output for /dev/sd?? paths, only show dm-???
 #   2021-11-02  njeffrey	Bug fix in regex detecting AIX hdisk IOPS
 #   2022-12-30  njeffrey	Add --exclude= parameter
-#   2023-10-02  njeffrey	Refactor check_iostat_Linux subroutine to use JSON output 
+#   2023-10-04  njeffrey	Refactor check_iostat_Linux subroutine to detect different columns in iostat output (varies by Linux version)
 
 
 
@@ -411,180 +411,220 @@ sub run_iostat_Linux {
    #         Disk-Multipath     use this naming format: /dev/dm-0  /dev/dm-1  /dev/dm-2
    #         Raspberry Pi SD card uses this format:     /dev/mmcblk0             
    #
-   # This is the output of "iostat -d -x -m -o JSON" from a Linux system.  Note that the -x switch is only supported on 2.5+ kernels
-   # Please note that we intentionally use JSON output because different versions of Ubuntu/Debian/RHEL/CentOS have slightly different column headers, making the regex unique for different Linux flavours
+   # 
+   # Unfortunately, the output of the iostat command on Linux has not remained consistent over the years, 
+   # making it impossible to use a single regex to match across all common Linux versions and distros.
    #
-   # # iostat -d -x -m 1 2 -o JSON
-   #  {"sysstat": {
-   #      "hosts": [
-   #         {
-   #            "nodename": "pxe",
-   #            "sysname": "Linux",
-   #            "release": "5.14.0-368.el9.x86_64",
-   #            "machine": "x86_64",
-   #            "number-of-cpus": 2,
-   #            "date": "2023-10-01",
-   #            "statistics": [
-   #               {
-   #                  "disk": [
-   #                     {"disk_device": "dm-0", "r/s": 0.27, "w/s": 0.35, "d/s": 0.00, "f/s": 0.00, "rMB/s": 0.01, "wMB/s": 0.00, "dMB/s": 0.00, "svctm": 0.00, "util": 0.04},
-   #                     {"disk_device": "dm-1", "r/s": 0.00, "w/s": 0.00, "d/s": 0.00, "f/s": 0.00, "rMB/s": 0.00, "wMB/s": 0.00, "dMB/s": 0.00, "svctm": 0.00, "util": 0.00},
-   #                     {"disk_device": "dm-2", "r/s": 1.22, "w/s": 0.08, "d/s": 0.00, "f/s": 0.00, "rMB/s": 0.14, "wMB/s": 0.13, "dMB/s": 0.00, "svctm": 0.05, "util": 0.20},
-   #                     {"disk_device": "sda",  "r/s": 1.22, "w/s": 0.12, "d/s": 0.00, "f/s": 0.00, "rMB/s": 0.14, "wMB/s": 0.13, "dMB/s": 0.00, "svctm": 0.09, "util": 0.28},
-   #                     {"disk_device": "sdb",  "r/s": 0.28, "w/s": 0.29, "d/s": 0.00, "f/s": 0.00, "rMB/s": 0.01, "wMB/s": 0.00, "dMB/s": 0.00, "svctm": 0.00, "util": 0.04}
-   #                  ]
-   #               },
-   #               {
-   #                  "disk": [
-   #                     {"disk_device": "dm-0", "r/s": 0.00, "w/s": 0.00, "d/s": 0.00, "f/s": 0.00, "rMB/s": 0.00, "wMB/s": 0.00, "dMB/s": 0.00, "svctm": 0.00, "util": 0.00},
-   #                     {"disk_device": "dm-1", "r/s": 0.00, "w/s": 0.00, "d/s": 0.00, "f/s": 0.00, "rMB/s": 0.00, "wMB/s": 0.00, "dMB/s": 0.00, "svctm": 0.00, "util": 0.00},
-   #                     {"disk_device": "dm-2", "r/s": 0.00, "w/s": 0.00, "d/s": 0.00, "f/s": 0.00, "rMB/s": 0.00, "wMB/s": 0.00, "dMB/s": 0.00, "svctm": 0.00, "util": 0.00},
-   #                     {"disk_device": "sda",  "r/s": 0.00, "w/s": 0.00, "d/s": 0.00, "f/s": 0.00, "rMB/s": 0.00, "wMB/s": 0.00, "dMB/s": 0.00, "svctm": 0.00, "util": 0.00},
-   #                     {"disk_device": "sdb",  "r/s": 0.00, "w/s": 0.00, "d/s": 0.00, "f/s": 0.00, "rMB/s": 0.00, "wMB/s": 0.00, "dMB/s": 0.00, "svctm": 0.00, "util": 0.00}
-   #                  ]
-   #               }
-   #            ]
-   #         }
-   #      ]
-   #  }}
+   # In a particularly annoying difference, RHEL uses a colon in the header row after "Device:", but Ubuntu omits the colon.
+   # We work around this by stripping out all colons to make the regex simpler.
+   #
+   # For example, these are the outputs of the "iostat -d -x -m" command from assorted versions of RHEL/CentOS/Debian/Ubuntu
+   #
+   # RHEL6 (missing r_wait and w_await) 
+   # Device:         rrqm/s   wrqm/s     r/s     w/s    rMB/s    wMB/s avgrq-sz avgqu-sz   await   svctm  %util
+   # sda               0.01     0.73    0.52   17.23     0.03     0.21    27.47     0.02    1.17   0.11   0.19
+   #
+   # RHEL7 / CentOS7 / Ubuntu 16.04
+   # Device:         rrqm/s   wrqm/s     r/s     w/s    rMB/s    wMB/s avgrq-sz avgqu-sz   await r_await w_await  svctm  %util
+   # sda               0.01     0.73    0.52   17.23     0.03     0.21    27.47     0.02    1.17    0.88    1.18   0.11   0.19
+   #
+   # RHEL8 / CentOS8 / Debian10 (aka Raspian) on Raspberry Pi / Ubuntu 18.04
+   # Device            r/s     w/s     rMB/s     wMB/s   rrqm/s   wrqm/s  %rrqm  %wrqm r_await w_await aqu-sz rareq-sz wareq-sz  svctm  %util
+   # sda              0.37    0.79      0.02      0.01     0.00     0.27   1.00  25.49    1.76    2.08   0.00    55.01    15.24   0.80   0.09
+   # mmcblk0          0.37    0.79      0.02      0.01     0.00     0.27   1.00  25.49    1.76    2.08   0.00    55.01    15.24   0.80   0.09
+   #
+   # Ubuntu 20.04
+   # Device    r/s  rMB/s   rrqm/s  %rrqm r_await rareq-sz  w/s  wMB/s  wrqm/s  %wrqm w_await wareq-sz  d/s  dMB/s drqm/s  %drqm d_await dareq-sz  aqu-sz  %util
+   # sda    145.92   5.37    67.72  31.70    0.42    37.72 9.23   0.27    8.22  47.12    0.25    30.04 0.00   0.00   0.00   0.00    0.00     0.00    0.00  11.03
+   #
+   # RHEL9 / CentOS9 / Ubuntu 22.04
+   # Device            r/s     rMB/s   rrqm/s  %rrqm r_await rareq-sz     w/s     wMB/s   wrqm/s  %wrqm w_await wareq-sz     d/s     dMB/s   drqm/s  %drqm d_await dareq-sz     f/s f_await  aqu-sz  %util
+   # sda              1.25      0.14     0.00   0.00    0.48   118.27    0.06      0.07     0.03  30.49  693.37  1112.41    0.00      0.00     0.00   0.00    0.00     0.00    0.00    0.00    0.04   0.20
+   #
+   # 
+   # Figure out whhich of the above iostat output formats we are dealing with
+   my $iostat_format = "unknown";									#initialize variable
+   $cmd = "iostat -d -x -m 1 1";									#define command to be run
+   print "   running command: $cmd \n" if ($verbose eq "yes");
+   open(IN,"$cmd |");                        								#open filehandle using command output
+   while (<IN>) {                                            						#read a line from filehandle
+      if (/^Device/) {											#parse out the header line that will show us all the columns in the iostat output
+         s/\//_/g;                                     							#clean up regex by replacing / with _        (because / is a reserved character in perl regex)
+         s/\-/_/g;                                     							#clean up regex by replacing - with _        (because - is a reserved character in perl regex)
+         s/\%//g;                                     							#clean up regex by removing any % characters (because % is a reserved character in perl)
+         s/\t/ /g;                                     							#simplify regex by replacing tabs with spaces
+         s/ +/ /g;                                     							#clean up regex by replacing multiple spaces with a single space (to simplify regex matching)
+         s/://g;                                     							#simplify regex by removing : character (because RHEL puts a colon after Device: but Ubuntu does not)
+         #print $_;
+
+         #
+         # At this point, the iostat header line showing the columns has been simplified to make it eash to match a regex.
+         # The contents of the $_ variable will now be matched
+         #
+         # RHEL6 
+         if (/Device rrqm_s wrqm_s r_s w_s rMB_s wMB_s avgrq_sz avgqu_sz await svctm util/) {
+            print "   detected iostat output consistent with RHEL6 format \n" if ($verbose eq "yes");
+            $iostat_format = "rhel6";
+         } 
+         # RHEL7 / Ubuntu 16.04
+         if (/Device rrqm_s wrqm_s r_s w_s rMB_s wMB_s avgrq_sz avgqu_sz await r_await w_await svctm util/) {
+            print "   detected iostat output consistent with RHEL7 / Ubuntu 16 format \n" if ($verbose eq "yes");
+            $iostat_format = "rhel7";
+         } 
+         # RHEL8 / Ubuntu 18.04
+         if (/Device r_s w_s rMB_s wMB_s rrqm_s wrqm_s rrqm wrqm r_await w_await aqu_sz rareq_sz wareq_sz svctm util/) {
+            print "   detected iostat output consistent with RHEL8 / Ubuntu 18 format \n" if ($verbose eq "yes");
+            $iostat_format = "rhel8";
+         } 
+         # Ubuntu 20.04
+         if (/Device r_s rMB_s rrqm_s rrqm r_await rareq_sz w_s wMB_s wrqm_s wrqm w_await wareq_sz d_s dMB_s drqm_s drqm d_await dareq_sz aqu_sz util/) {
+            print "   detected iostat output consistent with Ubuntu 20 format \n" if ($verbose eq "yes");
+            $iostat_format = "ubuntu20";
+         } 
+         # RHEL9 / Ubuntu 22.04
+         if (/Device r_s rMB_s rrqm_s rrqm r_await rareq_sz w_s wMB_s wrqm_s wrqm w_await wareq_sz d_s dMB_s drqm_s drqm d_await dareq_sz f_s f_await aqu_sz util/) {
+            print "   detected iostat output consistent with RHEL9 / Ubuntu 22 format \n" if ($verbose eq "yes");
+            $iostat_format = "rhel9";
+         } 
+         #
+         # Confirm that we were able to figure out iostat output format 
+         if ($iostat_format eq "unknown") {
+            print "$CHECK_NAME UNKNOWN - could not determine iostat output format, please check your regex matching \n";
+            exit $UNKNOWN;										#exit script
+         }												#end of if block
+      } 												#end of if block
+   } 													#end of while loop
+   close IN;												#close filehandle
    #
    #
    #
-   # Define a temporary array and hash used only inside this subroutine
-   my (%temp_hash,@temp_array);  #for linux subroutine, please tidy up
    #
    # Get the average of ten iostat iterations, to avoid false alarms when the very first iteration is unusually high
    # The first time iostat is run, it sometimes returns a ridiculously high number that throws off the averages.
    # Run 11 iterations of iostat, but throw away the first value, leaving us with 10 readings to average.
    $count = 0;												#initialize counter variable
-   $cmd = "iostat -d -x -m 1 11 -o JSON";								#define command to be run
+   $cmd = "iostat -d -x -m 1 11";									#define command to be run
    print "   running command: $cmd \n" if ($verbose eq "yes");
    open(IN,"$cmd |");                        								#open filehandle using command output
    while (<IN>) {                                            						#read a line from filehandle
-      s/"//g;                                      							#clean up regex by removing " quotation marks
-      s/ //g;                                      							#clean up regex by removing spaces
-      s/\t//g;                                      							#clean up regex by removing tab characters
-      s/^{//g;                                      							#clean up regex by removing { characters from beginning of line
-      s/}$//g;                                      							#clean up regex by removing } characters from end       of line
-      s/^,$//g;                                      							#clean up regex by removing lines that contain only a comma
-      s/^]$//g;                                      							#clean up regex by removing lines that contain only a ] closing square bracket
-      s/},$//g;                                      							#clean up regex by removing }, from end of line
-      s/^$//g;                                      							#clean up regex by removing blank lines
-      s/,r\/s:/,iops_r:/g; 										#clean up regex by changing r/s:   to iops_r:                      (eliminate / from regex match)
-      s/,w\/s:/,iops_w:/g; 										#clean up regex by changing w/s:   to iops_w:                      (eliminate / from regex match)
-      s/,rMB\/s:/,MBps_r:/g; 										#clean up regex by changing rMB/s: to MBps_r:                      (eliminate / from regex match)
-      s/,wMB\/s:/,MBps_w:/g; 										#clean up regex by changing wMB/s: to MBps_w:                      (eliminate / from regex match)
-      s/\//_/g; 											#clean up regex by changing any / character in column headers to ? (eliminate / from regex match)
-      next if (/^sysstat:/);				 						#skip header line
-      next if (/^hosts:/);				 						#skip header line
-      next if (/^nodename:/);				 						#skip header line
-      next if (/^release:/);				 						#skip header line
-      next if (/^machine:/);				 						#skip header line
-      next if (/^number-of-cpus:/);			 						#skip header line
-      next if (/^date:/);				 						#skip header line
-      next if (/^statistics:/);				 						#skip header line
-      #
-      # At this point, the output for each iostat iteration should look similar to the following:
-      #
-      #disk:[
-      #disk_device:loop0,r/s:0.00,w/s:0.00,rMB/s:0.00,wMB/s:0.00,rrqm/s:0.00,wrqm/s:0.00,rrqm:0.00,wrqm:0.00,r_await:0.00,w_await:0.00,aqu-sz:0.00,rareq-sz:1.00,wareq-sz:0.00,svctm:0.00,util:0.00
-      #disk_device:sda,r/s:1.28,w/s:2.27,rMB/s:0.02,wMB/s:0.03,rrqm/s:0.10,wrqm/s:1.18,rrqm:7.23,wrqm:34.22,r_await:0.44,w_await:3.06,aqu-sz:0.01,rareq-sz:15.34,wareq-sz:11.36,svctm:0.21,util:0.07
-      #disk_device:sdb,r/s:4.84,w/s:0.78,rMB/s:0.58,wMB/s:0.56,rrqm/s:0.00,wrqm/s:0.07,rrqm:0.a01,wrqm:8.38,r_await:0.56,w_await:988.37,aqu-sz:0.77,rareq-sz:122.67,wareq-sz:744.07,svctm:1.67,util:0.94
-      #disk_device:dm-0,r/s:4.84,w/s:0.85,rMB/s:0.58,wMB/s:0.93,rrqm/s:0.00,wrqm/s:0.00,rrqm:0.00,wrqm:0.00,r_await:0.58,w_await:919.74,aqu-sz:0.78,rareq-sz:122.67,wareq-sz:1123.92,svctm:1.65,util:0.94
-      #disk_device:dm-1,r/s:1.36,w/s:3.43,rMB/s:0.02,wMB/s:0.03,rrqm/s:0.00,wrqm/s:0.00,rrqm:0.00,wrqm:0.00,r_await:0.54,w_await:2.76,aqu-sz:0.01,rareq-sz:14.30,wareq-sz:8.86,svctm:0.15,util:0.07
-      #disk_device:dm-2,r/s:0.01,w/s:0.02,rMB/s:0.00,wMB/s:0.00,rrqm/s:0.00,wrqm/s:0.00,rrqm:0.00,wrqm:0.00,r_await:0.79,w_await:4.53,aqu-sz:0.00,rareq-sz:5.88,wareq-sz:4.00,svctm:0.88,util:0.00
-      #
-      #disk:[
-      #disk_device:loop0,r/s:0.00,w/s:0.00,rMB/s:0.00,wMB/s:0.00,rrqm/s:0.00,wrqm/s:0.00,rrqm:0.00,wrqm:0.00,r_await:0.00,w_await:0.00,aqu-sz:0.00,rareq-sz:0.00,wareq-sz:0.00,svctm:0.00,util:0.00
-      #disk_device:sda,r/s:0.00,w/s:0.00,rMB/s:0.00,wMB/s:0.00,rrqm/s:0.00,wrqm/s:0.00,rrqm:0.00,wrqm:0.00,r_await:0.00,w_await:0.00,aqu-sz:0.00,rareq-sz:0.00,wareq-sz:0.00,svctm:0.00,util:0.00
-      #disk_device:sdb,r/s:0.00,w/s:0.00,rMB/s:0.00,wMB/s:0.00,rrqm/s:0.00,wrqm/s:0.00,rrqm:0.00,wrqm:0.00,r_await:0.00,w_await:0.00,aqu-sz:0.00,rareq-sz:0.00,wareq-sz:0.00,svctm:0.00,util:0.00
-      #disk_device:dm-0,r/s:0.00,w/s:0.00,rMB/s:0.00,wMB/s:0.00,rrqm/s:0.00,wrqm/s:0.00,rrqm:0.00,wrqm:0.00,r_await:0.00,w_await:0.00,aqu-sz:0.00,rareq-sz:0.00,wareq-sz:0.00,svctm:0.00,util:0.00
-      #disk_device:dm-1,r/s:0.00,w/s:0.00,rMB/s:0.00,wMB/s:0.00,rrqm/s:0.00,wrqm/s:0.00,rrqm:0.00,wrqm:0.00,r_await:0.00,w_await:0.00,aqu-sz:0.00,rareq-sz:0.00,wareq-sz:0.00,svctm:0.00,util:0.00
-      #disk_device:dm-2,r/s:0.00,w/s:0.00,rMB/s:0.00,wMB/s:0.00,rrqm/s:0.00,wrqm/s:0.00,rrqm:0.00,wrqm:0.00,r_await:0.00,w_await:0.00,aqu-sz:0.00,rareq-sz:0.00,wareq-sz:0.00,svctm:0.00,util:0.00
-      #
-      #
-      # The current contents of the $_ variable is nicely formatted comma-separated key-value pairs of key1:value1,key2:value2,key3:value3
-      # However, different Linux distros put the columns in slightly different order, or have slightly different column names, which means we can not use a simple regex to parse out the fields we want.
-      #
-      #
-      if (/^disk:/) {											#this value indicates the beginning of a new iostat iteration
-         $count++; 											#increment counter variable each time iostat runs a new iteration
-         print "   count=$count \n" if ($verbose eq "yes");
+      next if (/^Linux/);				 						#skip header line
+      next if (/^$/);				 							#skip blank  line
+      s/\t/ /g;                                      							#simplify regex by replacing tabs with spaces
+      s/ +/ /g;                                      							#simplify regex by collapsing multiple spaces into a single space
+      if (/^Device/) {											#increment counter for each iostat iteration
+         $count++;											#increment counter
+         print "   cumulative reading for iostat iteration count=$count \n" if ($verbose eq "yes");
       }
+      next if (/^Device/);										#skip header line after incrementing counter in previous line
       if ($count == 1) {
-         print "   skipping the first iostat iteration because it can give wildly inaccurate values \n" if ($verbose eq "yes");
+         print "   skipping the first iostat iteration \n" if ($verbose eq "yes");
       }
-      next unless ($count > 1);										#skip to next iostat iteration because the first values can be wildly inaccurate
+      next unless ($count > 1);										#skip the first iostat iteration because it shows the performance stas since last booth
+      $disk_name    = "unknown";									#initialize variable
+      $iops         = 0; 										#initialize variable
+      $MBps         = 0;										#initialize variable
+      $latency      = 0;										#initialize variable
+      $percent_busy = 0;										#initialize variable
       #
-      #
-      # now read a line that looks similar to one of the following:  (one line per disk device) and put each line in a temporary hash to split out the key:value pairs
-      #disk_device:sda,r/s:0.00,w/s:0.00,rMB/s:0.00,wMB/s:0.00,rrqm/s:0.00,wrqm/s:0.00,rrqm:0.00,wrqm:0.00,r_await:0.00,w_await:0.00,aqu-sz:0.00,rareq-sz:0.00,wareq-sz:0.00,svctm:0.00,util:0.00
-      #disk_device:sdb,r/s:0.00,w/s:0.00,rMB/s:0.00,wMB/s:0.00,rrqm/s:0.00,wrqm/s:0.00,rrqm:0.00,wrqm:0.00,r_await:0.00,w_await:0.00,aqu-sz:0.00,rareq-sz:0.00,wareq-sz:0.00,svctm:0.00,util:0.00
+      # parse out the iostat output for systems that use the RHEL6 format
       # 
-      if (/^disk_device:/) {
-         #print "   found line: $_  \n" if ($verbose eq "yes");
-         @temp_array = split(',', $_);	#split string into array elements made of key:value pairs
-         #print "temp_array is: @temp_array \n" if ($verbose eq "yes");
-         
-         foreach (@temp_array) {							#loop through each comma-separated element in the array
-            if (/([a-zA-Z0-9_\.\-]+):([a-zA-Z0-9_\.\-]+)/) {				#find a key:value pair separated by a colon
-               $temp_hash{$1} = $2;							#split the key:value pairs in the array into hash key:value 
-               #print "   Creating temporary hash key:value pair of $1:$2 \n" if ($verbose eq "yes");
-            }										#end of if block
-         }										#end of foreach loop
+      if ($iostat_format eq "rhel6") {
+         # the iostat output will look like the following:
+         # Device: rrqm_s wrqm_s  r_s   w_s rMB_s wMB_s avgrq_sz avgqu_sz await svctm util
+         # sda       0.01   0.73 0.52 17.23  0.03  0.21    27.47     0.02  1.17  0.11 0.19
+         # sdb       0.01   0.73 0.52 17.23  0.03  0.21    27.47     0.02  1.17  0.11 0.19
          #
-         #
-         # we now have a single line of iostat output in a hash that looks similar to:
-         # %temp_hash =>  disk_device => sda
-         #                iops_r      => 0.00
-         #                iops_w      => 0.00
-         #                MBps_r      => 0.00
-         #                MBps_w      => 0.00
-         #                svctm       => 0.00
-         #                r_await     => 0.00
-         #                w_await     => 0.00
-         #
-         # pull out the interesting values from the %temp_hash
-         $disk_name    = $temp_hash{disk_device};
-         #
-         $iops         = 0;								#initialize variable
-         $iops         = $iops + $temp_hash{iops_r} if ($temp_hash{iops_r}); 		#read IOPS plus write IOPS
-         $iops         = $iops + $temp_hash{iops_w} if ($temp_hash{iops_w}); 		#read IOPS plus write IOPS
-         #
-         $MBps         = 0;								#initialize variable
-         $MBps         = $MBps + $temp_hash{MBps_r} if ($temp_hash{MBps_r}); 		#read MBPS plus write MBPS
-         $MBps         = $MBps + $temp_hash{MBps_w} if ($temp_hash{MBps_w}); 		#read MBPS plus write MBPS
-         #
-         $percent_busy = 0;								#initialize variable
-         $percent_busy = $temp_hash{util} if ($temp_hash{util});  	
-         #
-         $latency      = 0;								#initialize variable
-         $latency      = $latency + $temp_hash{svctm}   if ($temp_hash{svctm});    	#some Linux distros use svctm, some use r_await and w_await
-         $latency      = $latency + $temp_hash{r_await} if ($temp_hash{r_await});  	#some Linux distros use svctm, some use r_await and w_await
-         $latency      = $latency + $temp_hash{w_await} if ($temp_hash{w_await});  	#some Linux distros use svctm, some use r_await and w_await
-         #
-         #
-         #
-         # Now we have pulled out the interesting values for a single disk from the temporary hash.  
-         # We will now put those values in a more permanent hash, using the disk device name as the hash key.
-         # initialize hash elements if they do not already exist
-         $disk_name = "unknown" unless $disk_name;
-         $io{$disk_name}{disk_name}    = $disk_name;
-         $io{$disk_name}{iops}         =0 unless $io{$disk_name}{iops};
-         $io{$disk_name}{MBps}         =0 unless $io{$disk_name}{MBps};
-         $io{$disk_name}{percent_busy} =0 unless $io{$disk_name}{percent_busy};
-         $io{$disk_name}{latency}      =0 unless $io{$disk_name}{latency};
-         #
-         #
-         # append a running total of readings for each iteration of iostat output
-         #
-         $io{$disk_name}{iops}         = $io{$disk_name}{iops}         + $iops;
-         $io{$disk_name}{MBps}         = $io{$disk_name}{MBps}         + $MBps;
-         $io{$disk_name}{percent_busy} = $io{$disk_name}{percent_busy} + $percent_busy;	
-         $io{$disk_name}{latency}      = $io{$disk_name}{latency}      + $latency;	
-         print "   disk_name=$disk_name iops=$io{$disk_name}{iops} MBps=$io{$disk_name}{MBps} latency=$io{$disk_name}{latency} percent_busy=$io{$disk_name}{percent_busy} \n" if ($verbose eq "yes");
-      }											#end of if block
-   }                                         						#end of while loop
+         if (/([a-zA-Z0-9_\-]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+)/) {
+            $disk_name    = $1;
+            $iops         = $4 + $5;  									#read IOPS + write IOPS
+            $MBps         = $6 + $7;									#read MBPS + write MBPS
+            $latency      = $11;									#this version of iostat only knows svctm, but not await
+            $percent_busy = $12;
+         }
+      }
+      #
+      # parse out the iostat output for systems that use the RHEL7 format
+      # 
+      if ($iostat_format eq "rhel7") {
+         # the iostat output will look like the following:
+         # Device:         rrqm/s   wrqm/s     r/s     w/s    rMB/s    wMB/s avgrq-sz avgqu-sz   await r_await w_await  svctm  %util
+         # sda               0.01     0.73    0.52   17.23     0.03     0.21    27.47     0.02    1.17    0.88    1.18   0.11   0.19
+         # sdb               0.01     0.73    0.52   17.23     0.03     0.21    27.47     0.02    1.17    0.88    1.18   0.11   0.19
+         if (/([a-zA-Z0-9_\-]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+)/) {
+            $disk_name    = $1;
+            $iops         = $4 + $5;  									#read IOPS + write IOPS
+            $MBps         = $6 + $7;									#read MBPS + write MBPS
+            $latency      = $11 + $12;									#this version of iostat understands await, more accurate than svctm
+            $percent_busy = $14;
+         }
+      }
+      #
+      # parse out the iostat output for systems that use the RHEL8 format
+      # 
+      if ($iostat_format eq "rhel8") {
+         # the iostat output will look like the following:
+         # Device            r/s     w/s     rMB/s     wMB/s   rrqm/s   wrqm/s  %rrqm  %wrqm r_await w_await aqu-sz rareq-sz wareq-sz  svctm  %util
+         # sda              0.37    0.79      0.02      0.01     0.00     0.27   1.00  25.49    1.76    2.08   0.00    55.01    15.24   0.80   0.09
+         # mmcblk0          0.37    0.79      0.02      0.01     0.00     0.27   1.00  25.49    1.76    2.08   0.00    55.01    15.24   0.80   0.09
+         if (/([a-zA-Z0-9_\-]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+)/) {
+            $disk_name    = $1;
+            $iops         = $2 + $3;  									#read IOPS + write IOPS
+            $MBps         = $4 + $5;									#read MBPS + write MBPS
+            $latency      = $10 + $11;									#this version of iostat understands await, more accurate than svctm
+            $percent_busy = $16;
+         }
+      }
+      #
+      # parse out the iostat output for systems that use the RHEL9 format
+      # 
+      if ($iostat_format eq "rhel9") {
+         # the iostat output will look like the following:
+         # Device            r/s     rMB/s   rrqm/s  %rrqm r_await rareq-sz     w/s     wMB/s   wrqm/s  %wrqm w_await wareq-sz     d/s     dMB/s   drqm/s  %drqm d_await dareq-sz     f/s f_await  aqu-sz  %util
+         # sda              1.25      0.14     0.00   0.00    0.48   118.27    0.06      0.07     0.03  30.49  693.37  1112.41    0.00      0.00     0.00   0.00    0.00     0.00    0.00    0.00    0.04   0.20
+         # sdb              1.25      0.14     0.00   0.00    0.48   118.27    0.06      0.07     0.03  30.49  693.37  1112.41    0.00      0.00     0.00   0.00    0.00     0.00    0.00    0.00    0.04   0.20
+         if (/([a-zA-Z0-9_\-]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+)/) {
+            $disk_name    = $1;
+            $iops         = $2 + $8;  									#read IOPS + write IOPS
+            $MBps         = $3 + $9;									#read MBPS + write MBPS
+            $latency      = $6 + $12;									#this version of iostat understands await, more accurate than svctm
+            $percent_busy = $23;
+         }
+      }
+      #
+      # parse out the iostat output for systems that use the Ubuntu 20 format
+      # 
+      if ($iostat_format eq "ubuntu20") {
+         # the iostat output will look like the following:
+         # Device    r/s  rMB/s   rrqm/s  %rrqm r_await rareq-sz  w/s  wMB/s  wrqm/s  %wrqm w_await wareq-sz  d/s  dMB/s drqm/s  %drqm d_await dareq-sz  aqu-sz  %util
+         # sda    145.92   5.37    67.72  31.70    0.42    37.72 9.23   0.27    8.22  47.12    0.25    30.04 0.00   0.00   0.00   0.00    0.00     0.00    0.00  11.03
+         # sdb    145.92   5.37    67.72  31.70    0.42    37.72 9.23   0.27    8.22  47.12    0.25    30.04 0.00   0.00   0.00   0.00    0.00     0.00    0.00  11.03
+         if (/([a-zA-Z0-9_\-]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+) ([0-9\.]+)/) {
+            $disk_name    = $1;
+            $iops         = $2 + $8;  									#read IOPS + write IOPS
+            $MBps         = $3 + $9;									#read MBPS + write MBPS
+            $latency      = $6 + $12;									#this version of iostat understands await, more accurate than svctm
+            $percent_busy = $21;
+         }
+      }
+      #
+      # At this point, we have figured out the correct regex to match the line of iostat output, and will now add the current values to a hash.
+      # Initalize the hash elements if they do not already exist
+      #
+      $io{$disk_name}{disk_name}    = $disk_name;
+      $io{$disk_name}{iops}         =0 unless $io{$disk_name}{iops};
+      $io{$disk_name}{MBps}         =0 unless $io{$disk_name}{MBps};
+      $io{$disk_name}{percent_busy} =0 unless $io{$disk_name}{percent_busy};
+      $io{$disk_name}{latency}      =0 unless $io{$disk_name}{latency};
+      #
+      # append a running total of readings for each iteration of iostat output
+      #
+      $io{$disk_name}{iops}         = $io{$disk_name}{iops}         + $iops;
+      $io{$disk_name}{MBps}         = $io{$disk_name}{MBps}         + $MBps;
+      $io{$disk_name}{percent_busy} = $io{$disk_name}{percent_busy} + $percent_busy;	
+      $io{$disk_name}{latency}      = $io{$disk_name}{latency}      + $latency;	
+      print "   disk_name=$disk_name iops=$io{$disk_name}{iops} MBps=$io{$disk_name}{MBps} latency=$io{$disk_name}{latency} percent_busy=$io{$disk_name}{percent_busy} \n" if ($verbose eq "yes");
+   }													#end of while loop
+   close IN;												#close filehandle
    #
    #
    #
@@ -596,10 +636,10 @@ sub run_iostat_Linux {
       $io{$key}{percent_busy} = $io{$key}{percent_busy} / 10;        					#divide by 10 to get average
       $io{$key}{latency}      = $io{$key}{latency}      / 10;        					#divide by 10 to get average
       #
-      $io{$key}{iops}         = sprintf("%.0f",$io{$key}{iops});         				#truncate to 0 decimal places
-      $io{$key}{MBps}         = sprintf("%.0f",$io{$key}{MBps});         				#truncate to 0 decimal places
-      $io{$key}{percent_busy} = sprintf("%.0f",$io{$key}{percent_busy}); 				#truncate to 0 decimal places
-      $io{$key}{latency}      = sprintf("%.0f",$io{$key}{latency});      				#truncate to 0 decimal places
+      $io{$key}{iops}         = sprintf("%.1f",$io{$key}{iops});         				#truncate to 1 decimal places
+      $io{$key}{MBps}         = sprintf("%.1f",$io{$key}{MBps});         				#truncate to 1 decimal places
+      $io{$key}{percent_busy} = sprintf("%.1f",$io{$key}{percent_busy}); 				#truncate to 1 decimal places
+      $io{$key}{latency}      = sprintf("%.1f",$io{$key}{latency});      				#truncate to 1 decimal places
       print "   Average: disk_name=$io{$key}{disk_name} percent_busy=$io{$key}{percent_busy} iops=$io{$key}{iops} MBps=$io{$key}{MBps} latency=$io{$key}{latency}ms \n" if ($verbose eq "yes");
    }                                                                 					#end of foreach loop
    #
