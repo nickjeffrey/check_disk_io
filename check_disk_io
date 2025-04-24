@@ -30,6 +30,7 @@
 #   2021-11-02  njeffrey	Bug fix in regex detecting AIX hdisk IOPS
 #   2022-12-30  njeffrey	Add --exclude= parameter
 #   2023-10-04  njeffrey	Refactor check_iostat_Linux subroutine to detect different columns in iostat output (varies by Linux version)
+#   2025-04-24  njeffrey	Bug fix in regex for detecting AIX hdisk read and write latency being reported in Seconds instead of milliseconds
 
 
 
@@ -877,7 +878,21 @@ sub run_iostat_AIX {
             $io{$disk_name}{MBps} = $io{$disk_name}{MBps} / 1000 / 1000;               			#yes, we are dividing by 1000 instead of 1024
             $io{$disk_name}{MBps}= sprintf("%.2f",$io{$disk_name}{MBps});              			#truncate to 2 decimal places
          }                                                                   				#end of if block
-         #
+         # 
+         # hdisk read and write latency is typically reported in milliseconds, 
+         # but if latency is high, the value may be reported as "1.2S" instead of 1200.
+         # Convert from seconds to milliseconds if necessary.
+         if ( $io{$disk_name}{read_latency} =~ /S/ ) {                                 			#check to see if value is in Seconds
+            $io{$disk_name}{read_latency} =~ s/S//;                                       		#remove the "S" unit of measurement
+            $io{$disk_name}{read_latency} = $io{$disk_name}{read_latency} * 1000;       		#convert from Seconds to milliseconds so we have consistent values
+            $io{$disk_name}{read_latency}= sprintf("%.0f",$io{$disk_name}{read_latency});      		#truncate to 0 decimal places
+         }                                                                   				#end of if block
+         if ( $io{$disk_name}{write_latency} =~ /S/ ) {                                			#check to see if value is in Seconds
+            $io{$disk_name}{write_latency} =~ s/S//;                                       		#remove the "S" unit of measurement
+            $io{$disk_name}{write_latency} = $io{$disk_name}{write_latency} * 1000;       		#convert from Seconds to milliseconds so we have consistent values
+            $io{$disk_name}{write_latency}= sprintf("%.0f",$io{$disk_name}{write_latency});    		#truncate to 0 decimal places
+         }                                                                   				#end of if block
+         # 
          # AIX sometimes reports bogus latency values when the device has zero traffic.
          # For example, if the MB/sec and IOPS values are both zero, it might have a bogus latency value of thousands of milliseconds.
          # Avoid these bogus values by resetting latency to zero if both MB/sec and IOPS are zero.
